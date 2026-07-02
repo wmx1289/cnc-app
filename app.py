@@ -8,7 +8,25 @@ import json
 from datetime import datetime
 
 # 모바일 화면에서도 꽉 차게 보이도록 layout="wide", 모바일 기기에서는 자동으로 세로로 정렬됩니다.
-st.set_page_config(page_title="스마트 가공 매니저", page_icon="⚙️", layout="wide")
+# initial_sidebar_state="expanded"를 추가하여 항상 열린 상태로 시작합니다.
+st.set_page_config(
+    page_title="스마트 가공 매니저", 
+    page_icon="⚙️", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 사이드바를 접는 '<' 버튼을 완전히 숨겨서 메뉴바를 고정시키는 커스텀 CSS
+st.markdown(
+    """
+    <style>
+        [data-testid="collapsedControl"] {
+            display: none;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 DB_FILE = "machining_db.json"
 
