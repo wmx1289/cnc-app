@@ -74,35 +74,49 @@ GM_DICTIONARY = {
     "M99": "서브 프로그램 종료 및 메인으로 복귀"
 }
 
-def load_data():
-    if not os.path.exists(DB_FILE):
-        initial_data = {
-            "setup_sheets": [],
-            "gcodes": [],
-            "memos": [],
-            "work_logs": []
-        }
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(initial_data, f, ensure_ascii=False, indent=4)
-        return initial_data
-    
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        needs_save = False
-        if "memos" not in data:
-            data["memos"] = []
-            needs_save = True
-        if "work_logs" not in data:
-            data["work_logs"] = []
-            needs_save = True
-            
-        if needs_save:
-            save_data(data)
-        return data
-
 def save_data(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
+
+def load_data():
+    initial_data = {
+        "setup_sheets": [],
+        "gcodes": [],
+        "memos": [],
+        "work_logs": []
+    }
+    
+    # 1. 파일이 없는 경우 새로 생성
+    if not os.path.exists(DB_FILE):
+        save_data(initial_data)
+        return initial_data
+    
+    # 2. 파일이 있는 경우 읽기 시도 (오류 원천 차단 로직 적용)
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            
+            # 파일이 완전히 비어있는 경우 (JSONDecodeError 사전 차단)
+            if not content:
+                raise ValueError("File is empty")
+                
+            data = json.loads(content)
+            
+            needs_save = False
+            # 이전 데이터에 누락된 키가 있으면 자동 보완
+            for key in initial_data.keys():
+                if key not in data:
+                    data[key] = []
+                    needs_save = True
+                    
+            if needs_save:
+                save_data(data)
+            return data
+            
+    # 3. 모든 종류의 예외(JSON 형식 오류, 빈 파일, 알 수 없는 에러 등) 발생 시 강제 초기화
+    except Exception as e:
+        save_data(initial_data)
+        return initial_data
 
 db = load_data()
 
@@ -112,15 +126,6 @@ menu = st.sidebar.radio(
     "메뉴를 선택하세요",
     ["📋 스마트 셋업 시트 작성", "🔍 셋업 시트 검색/조회", "💾 자주 쓰는 G코드 매니저", "📝 현장 수기 노트 / 자유 메모", "📅 일일 작업 일지"]
 )
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 📱 아이폰 / 태블릿 접속 방법")
-st.sidebar.info("""
-이 PC와 스마트폰이 **같은 Wi-Fi**에 연결되어 있다면, 
-스마트폰 브라우저 주소창에 이 PC의 
-**`로컬 IP 주소:8501`** 을 입력하시면 
-현장에서도 스마트폰으로 바로 사용할 수 있습니다!
-""")
 
 if menu == "📋 스마트 셋업 시트 작성":
     st.header("📋 신규 스마트 셋업 시트 작성")
@@ -153,8 +158,7 @@ if menu == "📋 스마트 셋업 시트 작성":
             height=170
         )
         
-        # 셋업 시트 사진 첨부 추가
-        setup_image = st.file_uploader("📷 세팅 사진 첨부 (선택사항)", type=["png", "jpg", "jpeg"])
+        setup_images = st.file_uploader("📷 세팅 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
         submitted = st.form_submit_button("💾 셋업 시트 저장하기")
         
@@ -162,9 +166,10 @@ if menu == "📋 스마트 셋업 시트 작성":
             if not part_name:
                 st.error("품명/품번은 필수 입력 항목입니다.")
             else:
-                image_b64 = ""
-                if setup_image is not None:
-                    image_b64 = base64.b64encode(setup_image.read()).decode('utf-8')
+                images_b64_list = []
+                if setup_images:
+                    for img in setup_images:
+                        images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
 
                 new_sheet = {
                     "id": datetime.now().strftime("%Y%m%d%H%M%S"),
@@ -175,7 +180,8 @@ if menu == "📋 스마트 셋업 시트 작성":
                     "g_code_coord": g_code_coord,
                     "tool_info": tool_info,
                     "knowhow": knowhow,
-                    "image_b64": image_b64,
+                    "images_b64": images_b64_list,
+                    "image_b64": "",
                     "date": datetime.now().strftime("%Y-%m-%d %H:%M")
                 }
                 db["setup_sheets"].append(new_sheet)
@@ -228,11 +234,17 @@ elif menu == "🔍 셋업 시트 검색/조회":
                 st.markdown("**💡 가공 노하우 및 마스터캠 주의점**")
                 st.info(sheet['knowhow'] if sheet['knowhow'] else "등록된 노하우 정보 없음")
                 
-                # 등록된 이미지가 있으면 출력
-                if sheet.get("image_b64"):
+                imgs_to_show = sheet.get("images_b64", [])
+                if not imgs_to_show and sheet.get("image_b64"):
+                    imgs_to_show = [sheet["image_b64"]]
+                
+                if imgs_to_show:
                     st.markdown("---")
-                    img_bytes = base64.b64decode(sheet["image_b64"])
-                    st.image(img_bytes, use_column_width=True)
+                    num_cols = min(len(imgs_to_show), 3) 
+                    cols = st.columns(num_cols)
+                    for i, img_b64 in enumerate(imgs_to_show):
+                        img_bytes = base64.b64decode(img_b64)
+                        cols[i % num_cols].image(img_bytes, use_column_width=True)
                 
                 st.markdown("<br>", unsafe_allow_html=True)
                 
@@ -256,9 +268,8 @@ elif menu == "🔍 셋업 시트 검색/조회":
                             edit_tool_info = st.text_area("공구 세팅 정보 수정", value=sheet.get('tool_info', ''), height=150)
                             edit_knowhow = st.text_area("가공 노하우 수정", value=sheet.get('knowhow', ''), height=150)
                             
-                            # 셋업 시트 사진 수정 기능 추가
-                            edit_image = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기)", type=["png", "jpg", "jpeg"], key=f"edit_img_{sheet['id']}")
-                            delete_image = st.checkbox("🗑️ 기존 사진 삭제", key=f"del_img_{sheet['id']}")
+                            edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{sheet['id']}")
+                            delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{sheet['id']}")
                             
                             if st.form_submit_button("💾 수정 저장"):
                                 for idx, s in enumerate(db["setup_sheets"]):
@@ -271,9 +282,11 @@ elif menu == "🔍 셋업 시트 검색/조회":
                                         db["setup_sheets"][idx]["tool_info"] = edit_tool_info
                                         db["setup_sheets"][idx]["knowhow"] = edit_knowhow
                                         
-                                        if edit_image is not None:
-                                            db["setup_sheets"][idx]["image_b64"] = base64.b64encode(edit_image.read()).decode('utf-8')
+                                        if edit_images:
+                                            db["setup_sheets"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
+                                            db["setup_sheets"][idx]["image_b64"] = ""
                                         elif delete_image:
+                                            db["setup_sheets"][idx]["images_b64"] = []
                                             db["setup_sheets"][idx]["image_b64"] = ""
                                             
                                         db["setup_sheets"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
@@ -353,12 +366,12 @@ elif menu == "💾 자주 쓰는 G코드 매니저":
 elif menu == "📝 현장 수기 노트 / 자유 메모":
     st.header("📝 현장 수기 노트 및 자유 메모")
     
-    with st.expander("➕ 새 노트 작성하기", expanded=True):
+    with st.expander("➕ 새 노트 작성하기"):
         with st.form("memo_form", clear_on_submit=True):
             memo_title = st.text_input("노트 제목", placeholder="예: 마스터캠 황삭 툴패스 설정 시 주의점, 도면 사진 등")
             memo_content = st.text_area("노트 내용", placeholder="수첩에 기록해둔 내용이나 잊지 말아야 할 세부 사항을 자유롭게 적어주세요.", height=150)
             
-            uploaded_image = st.file_uploader("📷 현장 사진 첨부 (선택사항)", type=["png", "jpg", "jpeg"])
+            uploaded_images = st.file_uploader("📷 현장 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
             
             memo_submitted = st.form_submit_button("💾 메모 저장하기")
             
@@ -366,15 +379,17 @@ elif menu == "📝 현장 수기 노트 / 자유 메모":
                 if not memo_title or not memo_content:
                     st.error("제목과 내용은 필수 입력 항목입니다.")
                 else:
-                    image_b64 = ""
-                    if uploaded_image is not None:
-                        image_b64 = base64.b64encode(uploaded_image.read()).decode('utf-8')
+                    images_b64_list = []
+                    if uploaded_images:
+                        for img in uploaded_images:
+                            images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
                         
                     new_memo = {
                         "id": datetime.now().strftime("%Y%m%d%H%M%S"),
                         "title": memo_title,
                         "content": memo_content,
-                        "image_b64": image_b64,
+                        "images_b64": images_b64_list,
+                        "image_b64": "",
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M")
                     }
                     db["memos"].append(new_memo)
@@ -400,10 +415,17 @@ elif menu == "📝 현장 수기 노트 / 자유 메모":
             with st.expander(f"📔 {memo['title']} ({memo['date']})"):
                 st.write(memo['content'])
                 
-                if memo.get("image_b64"):
+                imgs_to_show = memo.get("images_b64", [])
+                if not imgs_to_show and memo.get("image_b64"):
+                    imgs_to_show = [memo["image_b64"]]
+                
+                if imgs_to_show:
                     st.markdown("---")
-                    img_bytes = base64.b64decode(memo["image_b64"])
-                    st.image(img_bytes, use_column_width=True)
+                    num_cols = min(len(imgs_to_show), 3)
+                    cols = st.columns(num_cols)
+                    for i, img_b64 in enumerate(imgs_to_show):
+                        img_bytes = base64.b64decode(img_b64)
+                        cols[i % num_cols].image(img_bytes, use_column_width=True)
                 
                 st.markdown("<br>", unsafe_allow_html=True)
                 
@@ -415,8 +437,8 @@ elif menu == "📝 현장 수기 노트 / 자유 메모":
                             edit_title = st.text_input("제목 수정", value=memo['title'])
                             edit_content = st.text_area("내용 수정", value=memo['content'], height=200)
                             
-                            edit_image = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기)", type=["png", "jpg", "jpeg"], key=f"edit_img_{memo['id']}")
-                            delete_image = st.checkbox("🗑️ 기존 사진 삭제", key=f"del_img_{memo['id']}")
+                            edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{memo['id']}")
+                            delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{memo['id']}")
                             
                             if st.form_submit_button("💾 수정 저장"):
                                 for idx, m in enumerate(db["memos"]):
@@ -424,9 +446,11 @@ elif menu == "📝 현장 수기 노트 / 자유 메모":
                                         db["memos"][idx]["title"] = edit_title
                                         db["memos"][idx]["content"] = edit_content
                                         
-                                        if edit_image is not None:
-                                            db["memos"][idx]["image_b64"] = base64.b64encode(edit_image.read()).decode('utf-8')
+                                        if edit_images:
+                                            db["memos"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
+                                            db["memos"][idx]["image_b64"] = ""
                                         elif delete_image:
+                                            db["memos"][idx]["images_b64"] = []
                                             db["memos"][idx]["image_b64"] = ""
                                             
                                         db["memos"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
@@ -444,7 +468,7 @@ elif menu == "📅 일일 작업 일지":
     st.header("📅 일일 작업 일지")
     st.write("그날그날의 생산량, 특이사항, 인수인계 내용을 기록하고 관리합니다.")
     
-    with st.expander("➕ 새 작업 일지 작성하기", expanded=True):
+    with st.expander("➕ 새 작업 일지 작성하기"):
         with st.form("work_log_form", clear_on_submit=True):
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -459,8 +483,7 @@ elif menu == "📅 일일 작업 일지":
             tasks_done = st.text_area("생산 내역 (품명 및 수량 등)", placeholder="예:\n- 반도체 챔버 A형: 50개 완료\n- 하우징 커버 B형: 20개 황삭 진행", height=100)
             issues_notes = st.text_area("특이사항 및 인수인계", placeholder="예:\n- DNM500 절삭유 보충 필요함\n- 야간조 작업 시 T02 인서트 팁 교체 후 작업할 정", height=100)
             
-            # 작업 일지 사진 첨부 추가
-            log_image = st.file_uploader("📷 작업/현장 사진 첨부 (선택사항)", type=["png", "jpg", "jpeg"])
+            log_images = st.file_uploader("📷 작업/현장 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
             
             log_submitted = st.form_submit_button("💾 일지 저장하기")
             
@@ -468,9 +491,10 @@ elif menu == "📅 일일 작업 일지":
                 if not worker_name or not tasks_done:
                     st.error("작업자명과 생산 내역은 필수 입력 항목입니다.")
                 else:
-                    image_b64 = ""
-                    if log_image is not None:
-                        image_b64 = base64.b64encode(log_image.read()).decode('utf-8')
+                    images_b64_list = []
+                    if log_images:
+                        for img in log_images:
+                            images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
 
                     new_log = {
                         "id": datetime.now().strftime("%Y%m%d%H%M%S"),
@@ -480,7 +504,8 @@ elif menu == "📅 일일 작업 일지":
                         "machine": machine_used,
                         "tasks": tasks_done,
                         "issues": issues_notes,
-                        "image_b64": image_b64,
+                        "images_b64": images_b64_list,
+                        "image_b64": "",
                         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
                     }
                     db["work_logs"].append(new_log)
@@ -512,11 +537,17 @@ elif menu == "📅 일일 작업 일지":
                 st.markdown("**⚠️ 특이사항 및 인수인계:**")
                 st.info(log['issues'] if log['issues'] else "특이사항 없음")
                 
-                # 등록된 이미지가 있으면 출력
-                if log.get("image_b64"):
+                imgs_to_show = log.get("images_b64", [])
+                if not imgs_to_show and log.get("image_b64"):
+                    imgs_to_show = [log["image_b64"]]
+                
+                if imgs_to_show:
                     st.markdown("---")
-                    img_bytes = base64.b64decode(log["image_b64"])
-                    st.image(img_bytes, use_column_width=True)
+                    num_cols = min(len(imgs_to_show), 3)
+                    cols = st.columns(num_cols)
+                    for i, img_b64 in enumerate(imgs_to_show):
+                        img_bytes = base64.b64decode(img_b64)
+                        cols[i % num_cols].image(img_bytes, use_column_width=True)
                     
                 st.caption(f"작성 일시: {log['created_at']}")
                 
@@ -529,9 +560,8 @@ elif menu == "📅 일일 작업 일지":
                             edit_tasks = st.text_area("생산 내역 수정", value=log['tasks'], height=100)
                             edit_issues = st.text_area("특이사항 수정", value=log['issues'], height=100)
                             
-                            # 일지 사진 수정 기능 추가
-                            edit_image = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기)", type=["png", "jpg", "jpeg"], key=f"edit_img_{log['id']}")
-                            delete_image = st.checkbox("🗑️ 기존 사진 삭제", key=f"del_img_{log['id']}")
+                            edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{log['id']}")
+                            delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{log['id']}")
                             
                             if st.form_submit_button("💾 수정 저장"):
                                 for idx, l in enumerate(db["work_logs"]):
@@ -540,9 +570,11 @@ elif menu == "📅 일일 작업 일지":
                                         db["work_logs"][idx]["tasks"] = edit_tasks
                                         db["work_logs"][idx]["issues"] = edit_issues
                                         
-                                        if edit_image is not None:
-                                            db["work_logs"][idx]["image_b64"] = base64.b64encode(edit_image.read()).decode('utf-8')
+                                        if edit_images:
+                                            db["work_logs"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
+                                            db["work_logs"][idx]["image_b64"] = ""
                                         elif delete_image:
+                                            db["work_logs"][idx]["images_b64"] = []
                                             db["work_logs"][idx]["image_b64"] = ""
                                         break
                                 save_data(db)
