@@ -75,30 +75,48 @@ GM_DICTIONARY = {
 }
 
 def load_data():
+    initial_data = {
+        "setup_sheets": [],
+        "gcodes": [],
+        "memos": [],
+        "work_logs": []
+    }
+    
+    # 1. 파일이 아예 없는 경우 새로 생성
     if not os.path.exists(DB_FILE):
-        initial_data = {
-            "setup_sheets": [],
-            "gcodes": [],
-            "memos": [],
-            "work_logs": []
-        }
         with open(DB_FILE, "w", encoding="utf-8") as f:
             json.dump(initial_data, f, ensure_ascii=False, indent=4)
         return initial_data
     
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        needs_save = False
-        if "memos" not in data:
-            data["memos"] = []
-            needs_save = True
-        if "work_logs" not in data:
-            data["work_logs"] = []
-            needs_save = True
+    # 2. 파일이 있는 경우 읽기 시도
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
             
-        if needs_save:
-            save_data(data)
-        return data
+            needs_save = False
+            # 이전 버전에서 생성된 데이터에 누락된 키가 있다면 보완
+            if "setup_sheets" not in data:
+                data["setup_sheets"] = []
+                needs_save = True
+            if "gcodes" not in data:
+                data["gcodes"] = []
+                needs_save = True
+            if "memos" not in data:
+                data["memos"] = []
+                needs_save = True
+            if "work_logs" not in data:
+                data["work_logs"] = []
+                needs_save = True
+                
+            if needs_save:
+                save_data(data)
+            return data
+            
+    # 3. JSON 파일이 비어있거나 형식이 깨져서 에러(JSONDecodeError)가 날 경우 복구
+    except json.JSONDecodeError:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(initial_data, f, ensure_ascii=False, indent=4)
+        return initial_data
 
 def save_data(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
