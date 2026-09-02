@@ -6,11 +6,14 @@ os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
 import streamlit as st
 import json
 from datetime import datetime
+import re
+import ast
+import pandas as pd
+import ollama
 
-# 모바일 화면에서도 꽉 차게 보이도록 layout="wide", 모바일 기기에서는 자동으로 세로로 정렬됩니다.
-# initial_sidebar_state="expanded"를 추가하여 항상 열린 상태로 시작합니다.
+# 모바일 화면에서도 꽉 차게 보이도록 layout="wide", 사이드바 항상 열린 상태로 시작
 st.set_page_config(
-    page_title="스마트 가공 매니저", 
+    page_title="현장 통합 관리 시스템", 
     page_icon="⚙️", 
     layout="wide",
     initial_sidebar_state="expanded"
@@ -28,6 +31,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ==========================================
+# 1. 스마트 가공 매니저용 데이터베이스 설정
+# ==========================================
 DB_FILE = "machining_db.json"
 
 GM_DICTIONARY = {
@@ -79,509 +85,691 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 def load_data():
-    initial_data = {
-        "setup_sheets": [],
-        "gcodes": [],
-        "memos": [],
-        "work_logs": []
-    }
-    
-    # 1. 파일이 없는 경우 새로 생성
+    initial_data = {"setup_sheets": [], "gcodes": [], "memos": [], "work_logs": []}
     if not os.path.exists(DB_FILE):
         save_data(initial_data)
         return initial_data
-    
-    # 2. 파일이 있는 경우 읽기 시도 (오류 원천 차단 로직 적용)
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             content = f.read().strip()
-            
-            # 파일이 완전히 비어있는 경우 (JSONDecodeError 사전 차단)
             if not content:
                 raise ValueError("File is empty")
-                
             data = json.loads(content)
-            
             needs_save = False
-            # 이전 데이터에 누락된 키가 있으면 자동 보완
             for key in initial_data.keys():
                 if key not in data:
                     data[key] = []
                     needs_save = True
-                    
-            if needs_save:
-                save_data(data)
+            if needs_save: save_data(data)
             return data
-            
-    # 3. 모든 종류의 예외(JSON 형식 오류, 빈 파일, 알 수 없는 에러 등) 발생 시 강제 초기화
-    except Exception as e:
+    except Exception:
         save_data(initial_data)
         return initial_data
 
 db = load_data()
 
-st.sidebar.title("⚙️ 가공 노하우 매니저")
-st.sidebar.markdown("---")
-menu = st.sidebar.radio(
-    "메뉴를 선택하세요",
-    ["📋 스마트 셋업 시트 작성", "🔍 셋업 시트 검색/조회", "💾 자주 쓰는 G코드 매니저", "📝 현장 수기 노트 / 자유 메모", "📅 일일 작업 일지"]
+
+# ==========================================
+# 2. 공구/자재 장부용 공통 데이터 함수
+# ==========================================
+def 장부_불러오기(파일이름):
+    if os.path.exists(파일이름):
+        with open(파일이름, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return []
+
+def 장부_저장하기(파일이름, 데이터):
+    with open(파일이름, 'w', encoding='utf-8') as f:
+        json.dump(데이터, f, ensure_ascii=False, indent=4)
+
+def 장부_화면_출력(제목, 파일이름, 분류목록):
+    st.title(제목)
+    if 'current_menu' not in st.session_state or st.session_state.current_menu != 제목:
+        st.session_state.current_menu = 제목
+        st.session_state.ledger = 장부_불러오기(파일이름)
+        st.session_state.ai_extracted = None
+
+    tab1, tab2, tab3 = st.tabs(["월별 구매내역", "품목 통계", "새 구매 등록 (+AI)"])
+
+    with tab1:
+        st.subheader("구매내역 조회")
+        검색어 = st.text_input("🔍 품목명 검색:", key=f"search_{제목}")
+        if st.session_state.ledger:
+            df = pd.DataFrame(st.session_state.ledger)
+            
+            # 검색 필터 시 인덱스가 꼬이지 않도록 원본 순서(No.)를 부여
+            df.insert(0, 'No.', range(1, len(df) + 1))
+            
+            if 검색어: 
+                df = df[df['품목명'].str.contains(검색어)]
+                
+            st.dataframe(df.style.format({"단가": "₩{:,}", "총액": "₩{:,}"}), hide_index=True, use_container_width=True)
+            
+            st.markdown("---")
+            st.subheader("⚙️ 기록 수정 및 삭제")
+            st.info("💡 수정이나 삭제를 원하시는 기록의 **No.** 를 입력해주세요.")
+            
+            선택번호 = st.number_input("수정/삭제할 행 번호 (위 표의 No. 입력)", min_value=1, max_value=len(st.session_state.ledger), step=1, key=f"target_{제목}")
+            선택인덱스 = 선택번호 - 1
+            
+            if 0 <= 선택인덱스 < len(st.session_state.ledger):
+                선택데이터 = st.session_state.ledger[선택인덱스]
+                
+                col_edit, col_del = st.columns([2, 1])
+                
+                with col_edit:
+                    with st.expander(f"✏️ No.{선택번호} 기록 수정하기"):
+                        with st.form(f"edit_form_{제목}"):
+                            # 날짜 파싱
+                            try:
+                                edit_date = datetime.strptime(선택데이터.get("일자", datetime.now().strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+                            except:
+                                edit_date = datetime.now().date()
+                                
+                            수정_일자 = st.date_input("구매 일자", value=edit_date, key=f"e_date_{제목}")
+                            
+                            cat_idx = 분류목록.index(선택데이터.get("분류")) if 선택데이터.get("분류") in 분류목록 else 0
+                            수정_분류 = st.radio("분류 선택", 분류목록, index=cat_idx, horizontal=True, key=f"e_cat_{제목}")
+                            
+                            수정_품목명 = st.text_input("품목명", value=선택데이터.get("품목명", ""), key=f"e_name_{제목}")
+                            
+                            c1, c2 = st.columns(2)
+                            with c1: 
+                                수정_단가 = st.text_input("단가", value=str(선택데이터.get("단가", "")), key=f"e_price_{제목}")
+                            with c2: 
+                                수정_수량 = st.text_input("수량", value=str(선택데이터.get("수량", "")), key=f"e_qty_{제목}")
+                                
+                            if st.form_submit_button("💾 수정 완료", type="primary"):
+                                if not 수정_품목명 or not 수정_단가 or not 수정_수량:
+                                    st.warning("모든 항목을 입력해 주세요.")
+                                else:
+                                    try:
+                                        단가_숫자 = int(re.sub(r'[^0-9]', '', 수정_단가))
+                                        수량_숫자 = int(re.sub(r'[^0-9]', '', 수정_수량))
+                                        
+                                        st.session_state.ledger[선택인덱스] = {
+                                            "일자": 수정_일자.strftime("%Y-%m-%d"),
+                                            "분류": 수정_분류,
+                                            "품목명": 수정_품목명,
+                                            "단가": 단가_숫자,
+                                            "수량": 수량_숫자,
+                                            "총액": 단가_숫자 * 수량_숫자
+                                        }
+                                        장부_저장하기(파일이름, st.session_state.ledger)
+                                        st.success("기록이 성공적으로 수정되었습니다!")
+                                        st.rerun()
+                                    except ValueError:
+                                        st.error("단가와 수량은 숫자만 입력해 주세요.")
+                                        
+                with col_del:
+                    # 삭제 버튼 폼 바깥으로 빼서 독립적으로 동작하게 구성
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("🗑️ 선택 기록 영구 삭제", type="primary", key=f"btn_del_{제목}"):
+                        del st.session_state.ledger[선택인덱스]
+                        장부_저장하기(파일이름, st.session_state.ledger)
+                        st.success("기록이 삭제되었습니다.")
+                        st.rerun()
+        else:
+            st.info("기록된 데이터가 없습니다.")
+
+    with tab2:
+        st.subheader("분류별 구매 통계")
+        if st.session_state.ledger:
+            df = pd.DataFrame(st.session_state.ledger)
+            cat_tabs = st.tabs(분류목록)
+            for i, cat in enumerate(분류목록):
+                with cat_tabs[i]:
+                    cat_df = df[df['분류'] == cat]
+                    if not cat_df.empty:
+                        stats = cat_df.groupby('품목명').agg({'수량': 'sum', '총액': 'sum'}).reset_index()
+                        st.dataframe(stats.style.format({"총액": "₩{:,}"}), use_container_width=True)
+                    else:
+                        st.write(f"등록된 '{cat}' 내역이 없습니다.")
+        else:
+            st.info("데이터가 없습니다.")
+
+    with tab3:
+        st.subheader("📝 새 구매 내역 등록")
+        with st.expander("📸 영수증 사진 자동 입력 (EasyOCR + LLM)", expanded=False):
+            uploaded_file = st.file_uploader("영수증 이미지 업로드", type=['jpg', 'jpeg', 'png'], key=f"img_{제목}")
+            if uploaded_file is not None:
+                if st.button("분석 시작", key=f"ai_btn_{제목}"):
+                    with st.spinner('분석 중...'):
+                        try:
+                            import easyocr
+                            reader = easyocr.Reader(['ko', 'en'])
+                            추출된_원문 = "\n".join(reader.readtext(uploaded_file.read(), detail=0))
+                            if 추출된_원문.strip():
+                                프롬프트 = f"""텍스트 분석: {추출된_원문}\n분류는 {분류목록} 중 하나. 숫자는 쉼표 없이.\n양식: {{"일자":"YYYY-MM-DD","분류":"{분류목록[0]}","품목명":"이름","단가":0,"수량":0}}"""
+                                응답 = ollama.chat(model='llama3.2-vision', messages=[{'role':'user','content':프롬프트}], format='json')
+                                json_match = re.search(r'\{.*?\}', 응답['message']['content'].strip(), re.DOTALL)
+                                추출된_텍스트 = json_match.group(0) if json_match else "{" + 응답['message']['content'] + "}"
+                                try: st.session_state.ai_extracted = json.loads(추출된_텍스트)
+                                except: st.session_state.ai_extracted = ast.literal_eval(추출된_텍스트)
+                                st.success("분석 완료!")
+                            else: st.error("글자 인식 실패")
+                        except Exception as e: st.error(f"오류: {e}")
+
+        with st.form(f"form_{제목}"):
+            ai_data = st.session_state.ai_extracted or {}
+            
+            default_date = datetime.now().date()
+            if ai_data.get("일자"):
+                try: 
+                    default_date = datetime.strptime(ai_data["일자"], "%Y-%m-%d").date()
+                except: 
+                    pass
+            
+            입력_일자 = st.date_input("구매 일자", value=default_date)
+            기본분류 = 분류목록.index(ai_data.get("분류")) if ai_data.get("분류") in 분류목록 else 0
+            입력_분류 = st.radio("분류 선택", 분류목록, index=기본분류, horizontal=True)
+            입력_품목명 = st.text_input("품목명", value=ai_data.get("품목명", ""))
+            단가_정리 = re.sub(r'[^0-9]', '', str(ai_data.get("단가", "")))
+            수량_정리 = re.sub(r'[^0-9]', '', str(ai_data.get("수량", "")))
+            col1, col2 = st.columns(2)
+            with col1: 입력_단가 = st.text_input("단가", value=단가_정리)
+            with col2: 입력_수량 = st.text_input("수량", value=수량_정리 if 수량_정리 else "1")
+                
+            if st.form_submit_button("장부에 등록하기", type="primary"):
+                if not 입력_품목명 or not 입력_단가 or not 입력_수량:
+                    st.warning("모두 입력해 주세요.")
+                else:
+                    try:
+                        새기록 = {"일자": 입력_일자.strftime("%Y-%m-%d"), "분류": 입력_분류, "품목명": 입력_품목명, "단가": int(입력_단가), "수량": int(입력_수량), "총액": int(입력_단가) * int(입력_수량)}
+                        st.session_state.ledger.append(새기록)
+                        장부_저장하기(파일이름, st.session_state.ledger)
+                        st.session_state.ai_extracted = None
+                        st.success("저장 완료!")
+                        st.rerun()
+                    except ValueError: st.error("숫자만 적어주세요.")
+
+
+# ==========================================
+# 3. 사이드바 메인 라우팅 (메뉴 구성)
+# ==========================================
+st.sidebar.title("🗂️ 통합 시스템")
+# 💡 대분류 선택을 라디오 버튼으로 변경하여 모든 메뉴가 상시 노출되도록 개선
+메인메뉴 = st.sidebar.radio(
+    "대분류 선택:", 
+    ["스마트 가공 매니저", "원영공구 (공구/소재)", "익산비철 (비철/자재)"]
 )
 
-if menu == "📋 스마트 셋업 시트 작성":
-    st.header("📋 신규 스마트 셋업 시트 작성")
-    st.write("현장에서 가공한 제품의 세팅 정보와 마스터캠 주의사항을 기록합니다.")
-    
-    with st.form("setup_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            part_name = st.text_input("📦 품명 / 품번", placeholder="예: 반도체 챔버 커버 A형")
-            machine = st.selectbox("📟 가공 장비", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
-            category = st.selectbox("🛡️ 제품 분류", ["방산 부품", "반도체 장비부품", "산업 부품", "기타"])
-            
-        with col2:
-            material = st.text_input("🧪 소재 재질", placeholder="예: AL6061, SUS304, S45C 등")
-            g_code_coord = st.text_input("📍 작업 좌표계", placeholder="예: G54 (바이스 중앙 중심, 소재 상면 Z0)")
-            
-        st.markdown("---")
-        st.subheader("🛠️ 공구 세팅 및 가공 정보")
-        
-        tool_info = st.text_area(
-            "공구 리스트 (번호 / 공구명 / 조건 등)", 
-            placeholder="예:\nT01: 10파이 황삭 엔드밀 (S4000 / F1200)\nT02: 6파이 정삭 엔드밀 (S6000 / F800)\nT03: M6 탭",
-            height=150
-        )
-        
-        knowhow = st.text_area(
-            "💡 마스터캠 툴패스 설정 및 현장 가공 노하우 (주의사항)", 
-            placeholder="예:\n- 코너 부위에 잔삭이 남으므로 T02 정삭 진입 시 에어컷 확인 필수.\n- SUS304 재질 특성상 절삭유 공급 방향 유의하고 황삭 시 부하 체크할 것.",
-            height=170
-        )
-        
-        setup_images = st.file_uploader("📷 세팅 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-        
-        submitted = st.form_submit_button("💾 셋업 시트 저장하기")
-        
-        if submitted:
-            if not part_name:
-                st.error("품명/품번은 필수 입력 항목입니다.")
-            else:
-                images_b64_list = []
-                if setup_images:
-                    for img in setup_images:
-                        images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
+if 메인메뉴 == "스마트 가공 매니저":
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**메뉴를 선택하세요**")
+    가공메뉴 = st.sidebar.radio(
+        "스마트 가공 매니저 하위메뉴",
+        [
+            "📋 스마트 셋업 시트 작성", 
+            "🔍 셋업 시트 검색/조회", 
+            "💾 자주 쓰는 G코드 매니저", 
+            "📝 현장 수기 노트 / 자유 메모", 
+            "📅 일일 작업 일지"
+        ],
+        label_visibility="collapsed"
+    )
 
-                new_sheet = {
-                    "id": datetime.now().strftime("%Y%m%d%H%M%S"),
-                    "part_name": part_name,
-                    "machine": machine,
-                    "category": category,
-                    "material": material,
-                    "g_code_coord": g_code_coord,
-                    "tool_info": tool_info,
-                    "knowhow": knowhow,
-                    "images_b64": images_b64_list,
-                    "image_b64": "",
-                    "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-                }
-                db["setup_sheets"].append(new_sheet)
-                save_data(db)
-                st.success(f"🎉 [{part_name}] 셋업 시트가 성공적으로 저장되었습니다!")
-
-elif menu == "🔍 셋업 시트 검색/조회":
-    st.header("🔍 저장된 셋업 시트 검색")
-    
-    search_query = st.text_input("🔍 품명, 재질, 또는 노하우 키워드로 검색하세요", placeholder="검색어 입력...")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        filter_machine = st.multiselect("장비 필터", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
-    with col2:
-        filter_cat = st.multiselect("분류 필터", ["방산 부품", "반도체 장비부품", "산업 부품", "기타"])
+    if 가공메뉴 == "📋 스마트 셋업 시트 작성":
+        st.header("📋 신규 스마트 셋업 시트 작성")
+        st.write("현장에서 가공한 제품의 세팅 정보와 마스터캠 주의사항을 기록합니다.")
         
-    filtered_sheets = db["setup_sheets"]
-    
-    if search_query:
-        filtered_sheets = [
-            s for s in filtered_sheets 
-            if search_query.lower() in s["part_name"].lower() or 
-               search_query.lower() in s["material"].lower() or 
-               search_query.lower() in s["knowhow"].lower()
-        ]
-        
-    if filter_machine:
-        filtered_sheets = [s for s in filtered_sheets if s["machine"] in filter_machine]
-        
-    if filter_cat:
-        filtered_sheets = [s for s in filtered_sheets if s["category"] in filter_cat]
-        
-    st.markdown("---")
-    st.subheader(f"📊 검색 결과 (총 {len(filtered_sheets)}건)")
-    
-    if not filtered_sheets:
-        st.info("조건에 맞는 셋업 시트가 없습니다. 새로운 노하우를 등록해 보세요!")
-    else:
-        for sheet in reversed(filtered_sheets):
-            with st.expander(f"📦 [{sheet['machine']}] {sheet['part_name']} ({sheet['date']})"):
-                c1, c2, c3 = st.columns(3)
-                c1.markdown(f"**제품 분류:** {sheet['category']}")
-                c2.markdown(f"**소재 재질:** {sheet['material']}")
-                c3.markdown(f"**작업 좌표계:** {sheet['g_code_coord']}")
-                
-                st.markdown("**🛠️ 공구 세팅 정보**")
-                st.code(sheet['tool_info'] if sheet['tool_info'] else "등록된 공구 정보 없음")
-                
-                st.markdown("**💡 가공 노하우 및 마스터캠 주의점**")
-                st.info(sheet['knowhow'] if sheet['knowhow'] else "등록된 노하우 정보 없음")
-                
-                imgs_to_show = sheet.get("images_b64", [])
-                if not imgs_to_show and sheet.get("image_b64"):
-                    imgs_to_show = [sheet["image_b64"]]
-                
-                if imgs_to_show:
-                    st.markdown("---")
-                    num_cols = min(len(imgs_to_show), 3) 
-                    cols = st.columns(num_cols)
-                    for i, img_b64 in enumerate(imgs_to_show):
-                        img_bytes = base64.b64decode(img_b64)
-                        cols[i % num_cols].image(img_bytes, use_column_width=True)
-                
-                st.markdown("<br>", unsafe_allow_html=True)
-                
-                col_btn1, col_btn2 = st.columns([1, 1])
-                
-                with col_btn1:
-                    with st.expander("✏️ 시트 수정하기"):
-                        with st.form(f"edit_sheet_form_{sheet['id']}"):
-                            edit_part_name = st.text_input("품명 / 품번 수정", value=sheet.get('part_name', ''))
-                            
-                            machines = ["두산 DNM500", "두산 DNM650", "두산 GT2100"]
-                            machine_idx = machines.index(sheet['machine']) if sheet.get('machine') in machines else 0
-                            edit_machine = st.selectbox("가공 장비 수정", machines, index=machine_idx)
-                            
-                            categories = ["방산 부품", "반도체 장비부품", "산업 부품", "기타"]
-                            category_idx = categories.index(sheet['category']) if sheet.get('category') in categories else 0
-                            edit_category = st.selectbox("제품 분류 수정", categories, index=category_idx)
-                            
-                            edit_material = st.text_input("소재 재질 수정", value=sheet.get('material', ''))
-                            edit_g_code_coord = st.text_input("작업 좌표계 수정", value=sheet.get('g_code_coord', ''))
-                            edit_tool_info = st.text_area("공구 세팅 정보 수정", value=sheet.get('tool_info', ''), height=150)
-                            edit_knowhow = st.text_area("가공 노하우 수정", value=sheet.get('knowhow', ''), height=150)
-                            
-                            edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{sheet['id']}")
-                            delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{sheet['id']}")
-                            
-                            if st.form_submit_button("💾 수정 저장"):
-                                for idx, s in enumerate(db["setup_sheets"]):
-                                    if s["id"] == sheet["id"]:
-                                        db["setup_sheets"][idx]["part_name"] = edit_part_name
-                                        db["setup_sheets"][idx]["machine"] = edit_machine
-                                        db["setup_sheets"][idx]["category"] = edit_category
-                                        db["setup_sheets"][idx]["material"] = edit_material
-                                        db["setup_sheets"][idx]["g_code_coord"] = edit_g_code_coord
-                                        db["setup_sheets"][idx]["tool_info"] = edit_tool_info
-                                        db["setup_sheets"][idx]["knowhow"] = edit_knowhow
-                                        
-                                        if edit_images:
-                                            db["setup_sheets"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
-                                            db["setup_sheets"][idx]["image_b64"] = ""
-                                        elif delete_image:
-                                            db["setup_sheets"][idx]["images_b64"] = []
-                                            db["setup_sheets"][idx]["image_b64"] = ""
-                                            
-                                        db["setup_sheets"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
-                                        break
-                                save_data(db)
-                                st.rerun()
-                                
-                with col_btn2:
-                    if st.button("❌ 시트 삭제", key=f"del_{sheet['id']}"):
-                        db["setup_sheets"] = [s for s in db["setup_sheets"] if s["id"] != sheet["id"]]
-                        save_data(db)
-                        st.rerun()
-
-elif menu == "💾 자주 쓰는 G코드 매니저":
-    st.header("💾 자주 쓰는 G코드 & 수기 매크로")
-    st.subheader("📖 현장 G/M코드 기본 사전")
-    
-    dict_query = st.text_input("🔍 모르는 코드 번호나 한글 기능 검색", placeholder="예: M30, M29, 리지드, 탭...").strip()
-    
-    if dict_query:
-        found = False
-        q_upper = dict_query.upper()
-        
-        if len(q_upper) == 2 and q_upper[0] in ['G', 'M']:
-            q_upper = f"{q_upper[0]}0{q_upper[1]}"
+        with st.form("setup_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
             
-        for code, desc in GM_DICTIONARY.items():
-            if q_upper in code or dict_query in desc:
-                st.info(f"**{code}** : {desc}")
-                found = True
+            with col1:
+                part_name = st.text_input("📦 품명 / 품번", placeholder="예: 반도체 챔버 커버 A형")
+                machine = st.selectbox("📟 가공 장비", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
+                category = st.selectbox("🛡️ 제품 분류", ["방산 부품", "반도체 장비부품", "산업 부품", "기타"])
                 
-        if not found:
-            st.warning("사전에 등록되지 않은 코드이거나 검색어가 없습니다.")
-            
-    st.markdown("---")
-    
-    st.subheader("⚙️ 내 전용 매크로 & 세팅 블록 관리")
-    
-    with st.expander("➕ 새로운 매크로 패턴 등록하기"):
-        with st.form("gcode_form"):
-            g_title = st.text_input("코드 명칭", placeholder="예: 나사 가공 G76 사이클 기본 형태")
-            g_machine = st.selectbox("해당 장비", ["공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
-            g_code = st.text_area("G코드 내용", placeholder="G코드 블록을 입력하세요", height=150)
-            g_desc = st.text_input("코드 설명", placeholder="간단한 활용 팁이나 설명을 적어주세요")
-            
-            g_submitted = st.form_submit_button("저장하기")
-            if g_submitted:
-                if not g_title or not g_code:
-                    st.error("명칭과 코드 내용은 필수입니다.")
-                else:
-                    new_gcode = {
-                        "title": g_title,
-                        "machine": g_machine,
-                        "code": g_code,
-                        "description": g_desc
-                    }
-                    db["gcodes"].append(new_gcode)
-                    save_data(db)
-                    st.success("새로운 매크로가 등록되었습니다!")
-                    
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    for idx, g in enumerate(db["gcodes"]):
-        col_g1, col_g2 = st.columns([3, 1])
-        with col_g1:
-            st.markdown(f"#### 📌 {g['title']}")
-            st.caption(f"장비: {g['machine']} | 설명: {g['description']}")
-        with col_g2:
-            if st.button("🗑️ 삭제", key=f"del_g_{idx}"):
-                db["gcodes"].pop(idx)
-                save_data(db)
-                st.rerun()
+            with col2:
+                material = st.text_input("🧪 소재 재질", placeholder="예: AL6061, SUS304, S45C 등")
+                g_code_coord = st.text_input("📍 작업 좌표계", placeholder="예: G54 (바이스 중앙 중심, 소재 상면 Z0)")
                 
-        st.code(g["code"], language="glsl")
-        st.markdown("<br>", unsafe_allow_html=True)
-
-elif menu == "📝 현장 수기 노트 / 자유 메모":
-    st.header("📝 현장 수기 노트 및 자유 메모")
-    
-    with st.expander("➕ 새 노트 작성하기"):
-        with st.form("memo_form", clear_on_submit=True):
-            memo_title = st.text_input("노트 제목", placeholder="예: 마스터캠 황삭 툴패스 설정 시 주의점, 도면 사진 등")
-            memo_content = st.text_area("노트 내용", placeholder="수첩에 기록해둔 내용이나 잊지 말아야 할 세부 사항을 자유롭게 적어주세요.", height=150)
+            st.markdown("---")
+            st.subheader("🛠️ 공구 세팅 및 가공 정보")
             
-            uploaded_images = st.file_uploader("📷 현장 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+            tool_info = st.text_area(
+                "공구 리스트 (번호 / 공구명 / 조건 등)", 
+                placeholder="예:\nT01: 10파이 황삭 엔드밀 (S4000 / F1200)\nT02: 6파이 정삭 엔드밀 (S6000 / F800)\nT03: M6 탭",
+                height=150
+            )
             
-            memo_submitted = st.form_submit_button("💾 메모 저장하기")
+            knowhow = st.text_area(
+                "💡 마스터캠 툴패스 설정 및 현장 가공 노하우 (주의사항)", 
+                placeholder="예:\n- 코너 부위에 잔삭이 남으므로 T02 정삭 진입 시 에어컷 확인 필수.\n- SUS304 재질 특성상 절삭유 공급 방향 유의하고 황삭 시 부하 체크할 것.",
+                height=170
+            )
             
-            if memo_submitted:
-                if not memo_title or not memo_content:
-                    st.error("제목과 내용은 필수 입력 항목입니다.")
+            setup_images = st.file_uploader("📷 세팅 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+            
+            submitted = st.form_submit_button("💾 셋업 시트 저장하기")
+            
+            if submitted:
+                if not part_name:
+                    st.error("품명/품번은 필수 입력 항목입니다.")
                 else:
                     images_b64_list = []
-                    if uploaded_images:
-                        for img in uploaded_images:
+                    if setup_images:
+                        for img in setup_images:
                             images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
-                        
-                    new_memo = {
+
+                    new_sheet = {
                         "id": datetime.now().strftime("%Y%m%d%H%M%S"),
-                        "title": memo_title,
-                        "content": memo_content,
+                        "part_name": part_name,
+                        "machine": machine,
+                        "category": category,
+                        "material": material,
+                        "g_code_coord": g_code_coord,
+                        "tool_info": tool_info,
+                        "knowhow": knowhow,
                         "images_b64": images_b64_list,
                         "image_b64": "",
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M")
                     }
-                    db["memos"].append(new_memo)
+                    db["setup_sheets"].append(new_sheet)
                     save_data(db)
-                    st.success("새로운 노트가 저장되었습니다!")
-                    
-    st.markdown("---")
-    st.subheader("📚 저장된 수기 노트 목록")
-    
-    search_memo = st.text_input("🔍 노트 제목이나 내용으로 검색", placeholder="검색어 입력...")
-    
-    filtered_memos = db["memos"]
-    if search_memo:
-        filtered_memos = [
-            m for m in filtered_memos 
-            if search_memo.lower() in m["title"].lower() or search_memo.lower() in m["content"].lower()
-        ]
+                    st.success(f"🎉 [{part_name}] 셋업 시트가 성공적으로 저장되었습니다!")
+
+    elif 가공메뉴 == "🔍 셋업 시트 검색/조회":
+        st.header("🔍 저장된 셋업 시트 검색")
         
-    if not filtered_memos:
-        st.info("등록된 노트가 없습니다. 수첩에 있는 내용이나 사진들을 하나씩 옮겨보세요!")
-    else:
-        for memo in reversed(filtered_memos):
-            with st.expander(f"📔 {memo['title']} ({memo['date']})"):
-                st.write(memo['content'])
-                
-                imgs_to_show = memo.get("images_b64", [])
-                if not imgs_to_show and memo.get("image_b64"):
-                    imgs_to_show = [memo["image_b64"]]
-                
-                if imgs_to_show:
-                    st.markdown("---")
-                    num_cols = min(len(imgs_to_show), 3)
-                    cols = st.columns(num_cols)
-                    for i, img_b64 in enumerate(imgs_to_show):
-                        img_bytes = base64.b64decode(img_b64)
-                        cols[i % num_cols].image(img_bytes, use_column_width=True)
-                
-                st.markdown("<br>", unsafe_allow_html=True)
-                
-                col_btn1, col_btn2 = st.columns([1, 1])
-                
-                with col_btn1:
-                    with st.expander("✏️ 문서 수정하기"):
-                        with st.form(f"edit_memo_form_{memo['id']}"):
-                            edit_title = st.text_input("제목 수정", value=memo['title'])
-                            edit_content = st.text_area("내용 수정", value=memo['content'], height=200)
-                            
-                            edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{memo['id']}")
-                            delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{memo['id']}")
-                            
-                            if st.form_submit_button("💾 수정 저장"):
-                                for idx, m in enumerate(db["memos"]):
-                                    if m["id"] == memo["id"]:
-                                        db["memos"][idx]["title"] = edit_title
-                                        db["memos"][idx]["content"] = edit_content
-                                        
-                                        if edit_images:
-                                            db["memos"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
-                                            db["memos"][idx]["image_b64"] = ""
-                                        elif delete_image:
-                                            db["memos"][idx]["images_b64"] = []
-                                            db["memos"][idx]["image_b64"] = ""
+        search_query = st.text_input("🔍 품명, 재질, 또는 노하우 키워드로 검색하세요", placeholder="검색어 입력...")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            filter_machine = st.multiselect("장비 필터", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
+        with col2:
+            filter_cat = st.multiselect("분류 필터", ["방산 부품", "반도체 장비부품", "산업 부품", "기타"])
+            
+        filtered_sheets = db["setup_sheets"]
+        
+        if search_query:
+            filtered_sheets = [
+                s for s in filtered_sheets 
+                if search_query.lower() in s["part_name"].lower() or 
+                   search_query.lower() in s["material"].lower() or 
+                   search_query.lower() in s["knowhow"].lower()
+            ]
+            
+        if filter_machine:
+            filtered_sheets = [s for s in filtered_sheets if s["machine"] in filter_machine]
+            
+        if filter_cat:
+            filtered_sheets = [s for s in filtered_sheets if s["category"] in filter_cat]
+            
+        st.markdown("---")
+        st.subheader(f"📊 검색 결과 (총 {len(filtered_sheets)}건)")
+        
+        if not filtered_sheets:
+            st.info("조건에 맞는 셋업 시트가 없습니다. 새로운 노하우를 등록해 보세요!")
+        else:
+            for sheet in reversed(filtered_sheets):
+                with st.expander(f"📦 [{sheet['machine']}] {sheet['part_name']} ({sheet['date']})"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.markdown(f"**제품 분류:** {sheet['category']}")
+                    c2.markdown(f"**소재 재질:** {sheet['material']}")
+                    c3.markdown(f"**작업 좌표계:** {sheet['g_code_coord']}")
+                    
+                    st.markdown("**🛠️ 공구 세팅 정보**")
+                    st.code(sheet['tool_info'] if sheet['tool_info'] else "등록된 공구 정보 없음")
+                    
+                    st.markdown("**💡 가공 노하우 및 마스터캠 주의점**")
+                    st.info(sheet['knowhow'] if sheet['knowhow'] else "등록된 노하우 정보 없음")
+                    
+                    imgs_to_show = sheet.get("images_b64", [])
+                    if not imgs_to_show and sheet.get("image_b64"):
+                        imgs_to_show = [sheet["image_b64"]]
+                    
+                    if imgs_to_show:
+                        st.markdown("---")
+                        num_cols = min(len(imgs_to_show), 3) 
+                        cols = st.columns(num_cols)
+                        for i, img_b64 in enumerate(imgs_to_show):
+                            img_bytes = base64.b64decode(img_b64)
+                            cols[i % num_cols].image(img_bytes, use_column_width=True)
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    col_btn1, col_btn2 = st.columns([1, 1])
+                    
+                    with col_btn1:
+                        with st.expander("✏️ 시트 수정하기"):
+                            with st.form(f"edit_sheet_form_{sheet['id']}"):
+                                edit_part_name = st.text_input("품명 / 품번 수정", value=sheet.get('part_name', ''))
+                                
+                                machines = ["두산 DNM500", "두산 DNM650", "두산 GT2100"]
+                                machine_idx = machines.index(sheet['machine']) if sheet.get('machine') in machines else 0
+                                edit_machine = st.selectbox("가공 장비 수정", machines, index=machine_idx)
+                                
+                                categories = ["방산 부품", "반도체 장비부품", "산업 부품", "기타"]
+                                category_idx = categories.index(sheet['category']) if sheet.get('category') in categories else 0
+                                edit_category = st.selectbox("제품 분류 수정", categories, index=category_idx)
+                                
+                                edit_material = st.text_input("소재 재질 수정", value=sheet.get('material', ''))
+                                edit_g_code_coord = st.text_input("작업 좌표계 수정", value=sheet.get('g_code_coord', ''))
+                                edit_tool_info = st.text_area("공구 세팅 정보 수정", value=sheet.get('tool_info', ''), height=150)
+                                edit_knowhow = st.text_area("가공 노하우 수정", value=sheet.get('knowhow', ''), height=150)
+                                
+                                edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{sheet['id']}")
+                                delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{sheet['id']}")
+                                
+                                if st.form_submit_button("💾 수정 저장"):
+                                    for idx, s in enumerate(db["setup_sheets"]):
+                                        if s["id"] == sheet["id"]:
+                                            db["setup_sheets"][idx]["part_name"] = edit_part_name
+                                            db["setup_sheets"][idx]["machine"] = edit_machine
+                                            db["setup_sheets"][idx]["category"] = edit_category
+                                            db["setup_sheets"][idx]["material"] = edit_material
+                                            db["setup_sheets"][idx]["g_code_coord"] = edit_g_code_coord
+                                            db["setup_sheets"][idx]["tool_info"] = edit_tool_info
+                                            db["setup_sheets"][idx]["knowhow"] = edit_knowhow
                                             
-                                        db["memos"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
-                                        break
-                                save_data(db)
-                                st.rerun()
-                                
-                with col_btn2:
-                    if st.button("❌ 문서 삭제", key=f"del_memo_{memo['id']}"):
-                        db["memos"] = [m for m in db["memos"] if m["id"] != memo["id"]]
-                        save_data(db)
-                        st.rerun()
+                                            if edit_images:
+                                                db["setup_sheets"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
+                                                db["setup_sheets"][idx]["image_b64"] = ""
+                                            elif delete_image:
+                                                db["setup_sheets"][idx]["images_b64"] = []
+                                                db["setup_sheets"][idx]["image_b64"] = ""
+                                                
+                                            db["setup_sheets"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
+                                            break
+                                    save_data(db)
+                                    st.rerun()
+                                    
+                    with col_btn2:
+                        if st.button("❌ 시트 삭제", key=f"del_{sheet['id']}"):
+                            db["setup_sheets"] = [s for s in db["setup_sheets"] if s["id"] != sheet["id"]]
+                            save_data(db)
+                            st.rerun()
 
-elif menu == "📅 일일 작업 일지":
-    st.header("📅 일일 작업 일지")
-    st.write("그날그날의 생산량, 특이사항, 인수인계 내용을 기록하고 관리합니다.")
-    
-    with st.expander("➕ 새 작업 일지 작성하기"):
-        with st.form("work_log_form", clear_on_submit=True):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                log_date = st.date_input("작업 일자")
-            with col2:
-                worker_name = st.text_input("작업자명", placeholder="예: 홍길동")
-            with col3:
-                shift = st.selectbox("근무조", ["주간", "야간", "특근/기타"])
-                
-            machine_used = st.selectbox("가공 장비", ["전체/공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
-            
-            tasks_done = st.text_area("생산 내역 (품명 및 수량 등)", placeholder="예:\n- 반도체 챔버 A형: 50개 완료\n- 하우징 커버 B형: 20개 황삭 진행", height=100)
-            issues_notes = st.text_area("특이사항 및 인수인계", placeholder="예:\n- DNM500 절삭유 보충 필요함\n- 야간조 작업 시 T02 인서트 팁 교체 후 작업할 정", height=100)
-            
-            log_images = st.file_uploader("📷 작업/현장 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-            
-            log_submitted = st.form_submit_button("💾 일지 저장하기")
-            
-            if log_submitted:
-                if not worker_name or not tasks_done:
-                    st.error("작업자명과 생산 내역은 필수 입력 항목입니다.")
-                else:
-                    images_b64_list = []
-                    if log_images:
-                        for img in log_images:
-                            images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
-
-                    new_log = {
-                        "id": datetime.now().strftime("%Y%m%d%H%M%S"),
-                        "date": log_date.strftime("%Y-%m-%d"),
-                        "worker": worker_name,
-                        "shift": shift,
-                        "machine": machine_used,
-                        "tasks": tasks_done,
-                        "issues": issues_notes,
-                        "images_b64": images_b64_list,
-                        "image_b64": "",
-                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    }
-                    db["work_logs"].append(new_log)
-                    save_data(db)
-                    st.success("작업 일지가 성공적으로 저장되었습니다!")
-                    
-    st.markdown("---")
-    st.subheader("📋 지난 작업 일지 조회")
-    
-    search_log = st.text_input("🔍 작업자명, 장비명, 또는 내용으로 검색", placeholder="검색어 입력...")
-    
-    filtered_logs = db["work_logs"]
-    if search_log:
-        filtered_logs = [
-            l for l in filtered_logs 
-            if search_log.lower() in l["worker"].lower() or 
-               search_log.lower() in l["machine"].lower() or 
-               search_log.lower() in l["tasks"].lower() or 
-               search_log.lower() in l["issues"].lower()
-        ]
+    elif 가공메뉴 == "💾 자주 쓰는 G코드 매니저":
+        st.header("💾 자주 쓰는 G코드 & 수기 매크로")
+        st.subheader("📖 현장 G/M코드 기본 사전")
         
-    if not filtered_logs:
-        st.info("등록된 작업 일지가 없습니다. 오늘의 작업을 기록해 보세요!")
-    else:
-        for log in reversed(filtered_logs):
-            with st.expander(f"📅 [{log['date']}] {log['worker']} ({log['shift']}) - {log['machine']}"):
-                st.markdown("**🛠️ 생산 내역:**")
-                st.write(log['tasks'])
-                st.markdown("**⚠️ 특이사항 및 인수인계:**")
-                st.info(log['issues'] if log['issues'] else "특이사항 없음")
+        dict_query = st.text_input("🔍 모르는 코드 번호나 한글 기능 검색", placeholder="예: M30, M29, 리지드, 탭...").strip()
+        
+        if dict_query:
+            found = False
+            q_upper = dict_query.upper()
+            
+            if len(q_upper) == 2 and q_upper[0] in ['G', 'M']:
+                q_upper = f"{q_upper[0]}0{q_upper[1]}"
                 
-                imgs_to_show = log.get("images_b64", [])
-                if not imgs_to_show and log.get("image_b64"):
-                    imgs_to_show = [log["image_b64"]]
-                
-                if imgs_to_show:
-                    st.markdown("---")
-                    num_cols = min(len(imgs_to_show), 3)
-                    cols = st.columns(num_cols)
-                    for i, img_b64 in enumerate(imgs_to_show):
-                        img_bytes = base64.b64decode(img_b64)
-                        cols[i % num_cols].image(img_bytes, use_column_width=True)
+            for code, desc in GM_DICTIONARY.items():
+                if q_upper in code or dict_query in desc:
+                    st.info(f"**{code}** : {desc}")
+                    found = True
                     
-                st.caption(f"작성 일시: {log['created_at']}")
+            if not found:
+                st.warning("사전에 등록되지 않은 코드이거나 검색어가 없습니다.")
                 
-                col_btn1, col_btn2 = st.columns([1, 1])
+        st.markdown("---")
+        
+        st.subheader("⚙️ 내 전용 매크로 & 세팅 블록 관리")
+        
+        with st.expander("➕ 새로운 매크로 패턴 등록하기"):
+            with st.form("gcode_form"):
+                g_title = st.text_input("코드 명칭", placeholder="예: 나사 가공 G76 사이클 기본 형태")
+                g_machine = st.selectbox("해당 장비", ["공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
+                g_code = st.text_area("G코드 내용", placeholder="G코드 블록을 입력하세요", height=150)
+                g_desc = st.text_input("코드 설명", placeholder="간단한 활용 팁이나 설명을 적어주세요")
                 
-                with col_btn1:
-                    with st.expander("✏️ 일지 수정하기"):
-                        with st.form(f"edit_log_form_{log['id']}"):
-                            edit_worker = st.text_input("작업자명 수정", value=log['worker'])
-                            edit_tasks = st.text_area("생산 내역 수정", value=log['tasks'], height=100)
-                            edit_issues = st.text_area("특이사항 수정", value=log['issues'], height=100)
-                            
-                            edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{log['id']}")
-                            delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{log['id']}")
-                            
-                            if st.form_submit_button("💾 수정 저장"):
-                                for idx, l in enumerate(db["work_logs"]):
-                                    if l["id"] == log["id"]:
-                                        db["work_logs"][idx]["worker"] = edit_worker
-                                        db["work_logs"][idx]["tasks"] = edit_tasks
-                                        db["work_logs"][idx]["issues"] = edit_issues
-                                        
-                                        if edit_images:
-                                            db["work_logs"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
-                                            db["work_logs"][idx]["image_b64"] = ""
-                                        elif delete_image:
-                                            db["work_logs"][idx]["images_b64"] = []
-                                            db["work_logs"][idx]["image_b64"] = ""
-                                        break
-                                save_data(db)
-                                st.rerun()
-                                
-                with col_btn2:
-                    if st.button("❌ 일지 삭제", key=f"del_log_{log['id']}"):
-                        db["work_logs"] = [l for l in db["work_logs"] if l["id"] != log["id"]]
+                g_submitted = st.form_submit_button("저장하기")
+                if g_submitted:
+                    if not g_title or not g_code:
+                        st.error("명칭과 코드 내용은 필수입니다.")
+                    else:
+                        new_gcode = {
+                            "title": g_title,
+                            "machine": g_machine,
+                            "code": g_code,
+                            "description": g_desc
+                        }
+                        db["gcodes"].append(new_gcode)
                         save_data(db)
-                        st.rerun()
+                        st.success("새로운 매크로가 등록되었습니다!")
+                        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        for idx, g in enumerate(db["gcodes"]):
+            col_g1, col_g2 = st.columns([3, 1])
+            with col_g1:
+                st.markdown(f"#### 📌 {g['title']}")
+                st.caption(f"장비: {g['machine']} | 설명: {g['description']}")
+            with col_g2:
+                if st.button("🗑️ 삭제", key=f"del_g_{idx}"):
+                    db["gcodes"].pop(idx)
+                    save_data(db)
+                    st.rerun()
+                    
+            st.code(g["code"], language="glsl")
+            st.markdown("<br>", unsafe_allow_html=True)
+
+    elif 가공메뉴 == "📝 현장 수기 노트 / 자유 메모":
+        st.header("📝 현장 수기 노트 및 자유 메모")
+        
+        with st.expander("➕ 새 노트 작성하기"):
+            with st.form("memo_form", clear_on_submit=True):
+                memo_title = st.text_input("노트 제목", placeholder="예: 마스터캠 황삭 툴패스 설정 시 주의점, 도면 사진 등")
+                memo_content = st.text_area("노트 내용", placeholder="수첩에 기록해둔 내용이나 잊지 말아야 할 세부 사항을 자유롭게 적어주세요.", height=150)
+                
+                uploaded_images = st.file_uploader("📷 현장 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+                
+                memo_submitted = st.form_submit_button("💾 메모 저장하기")
+                
+                if memo_submitted:
+                    if not memo_title or not memo_content:
+                        st.error("제목과 내용은 필수 입력 항목입니다.")
+                    else:
+                        images_b64_list = []
+                        if uploaded_images:
+                            for img in uploaded_images:
+                                images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
+                            
+                        new_memo = {
+                            "id": datetime.now().strftime("%Y%m%d%H%M%S"),
+                            "title": memo_title,
+                            "content": memo_content,
+                            "images_b64": images_b64_list,
+                            "image_b64": "",
+                            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+                        }
+                        db["memos"].append(new_memo)
+                        save_data(db)
+                        st.success("새로운 노트가 저장되었습니다!")
+                        
+        st.markdown("---")
+        st.subheader("📚 저장된 수기 노트 목록")
+        
+        search_memo = st.text_input("🔍 노트 제목이나 내용으로 검색", placeholder="검색어 입력...")
+        
+        filtered_memos = db["memos"]
+        if search_memo:
+            filtered_memos = [
+                m for m in filtered_memos 
+                if search_memo.lower() in m["title"].lower() or search_memo.lower() in m["content"].lower()
+            ]
+            
+        if not filtered_memos:
+            st.info("등록된 노트가 없습니다. 수첩에 있는 내용이나 사진들을 하나씩 옮겨보세요!")
+        else:
+            for memo in reversed(filtered_memos):
+                with st.expander(f"📔 {memo['title']} ({memo['date']})"):
+                    st.write(memo['content'])
+                    
+                    imgs_to_show = memo.get("images_b64", [])
+                    if not imgs_to_show and memo.get("image_b64"):
+                        imgs_to_show = [memo["image_b64"]]
+                    
+                    if imgs_to_show:
+                        st.markdown("---")
+                        num_cols = min(len(imgs_to_show), 3)
+                        cols = st.columns(num_cols)
+                        for i, img_b64 in enumerate(imgs_to_show):
+                            img_bytes = base64.b64decode(img_b64)
+                            cols[i % num_cols].image(img_bytes, use_column_width=True)
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    col_btn1, col_btn2 = st.columns([1, 1])
+                    
+                    with col_btn1:
+                        with st.expander("✏️ 문서 수정하기"):
+                            with st.form(f"edit_memo_form_{memo['id']}"):
+                                edit_title = st.text_input("제목 수정", value=memo['title'])
+                                edit_content = st.text_area("내용 수정", value=memo['content'], height=200)
+                                
+                                edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{memo['id']}")
+                                delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{memo['id']}")
+                                
+                                if st.form_submit_button("💾 수정 저장"):
+                                    for idx, m in enumerate(db["memos"]):
+                                        if m["id"] == memo["id"]:
+                                            db["memos"][idx]["title"] = edit_title
+                                            db["memos"][idx]["content"] = edit_content
+                                            
+                                            if edit_images:
+                                                db["memos"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
+                                                db["memos"][idx]["image_b64"] = ""
+                                            elif delete_image:
+                                                db["memos"][idx]["images_b64"] = []
+                                                db["memos"][idx]["image_b64"] = ""
+                                                
+                                            db["memos"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
+                                            break
+                                    save_data(db)
+                                    st.rerun()
+                                    
+                    with col_btn2:
+                        if st.button("❌ 문서 삭제", key=f"del_memo_{memo['id']}"):
+                            db["memos"] = [m for m in db["memos"] if m["id"] != memo["id"]]
+                            save_data(db)
+                            st.rerun()
+
+    elif 가공메뉴 == "📅 일일 작업 일지":
+        st.header("📅 일일 작업 일지")
+        st.write("그날그날의 생산량, 특이사항, 인수인계 내용을 기록하고 관리합니다.")
+        
+        with st.expander("➕ 새 작업 일지 작성하기"):
+            with st.form("work_log_form", clear_on_submit=True):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    log_date = st.date_input("작업 일자")
+                with col2:
+                    worker_name = st.text_input("작업자명", placeholder="예: 홍길동")
+                with col3:
+                    shift = st.selectbox("근무조", ["주간", "야간", "특근/기타"])
+                    
+                machine_used = st.selectbox("가공 장비", ["전체/공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
+                
+                tasks_done = st.text_area("생산 내역 (품명 및 수량 등)", placeholder="예:\n- 반도체 챔버 A형: 50개 완료\n- 하우징 커버 B형: 20개 황삭 진행", height=100)
+                issues_notes = st.text_area("특이사항 및 인수인계", placeholder="예:\n- DNM500 절삭유 보충 필요함\n- 야간조 작업 시 T02 인서트 팁 교체 후 작업할 정", height=100)
+                
+                log_images = st.file_uploader("📷 작업/현장 사진 첨부 (여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+                
+                log_submitted = st.form_submit_button("💾 일지 저장하기")
+                
+                if log_submitted:
+                    if not worker_name or not tasks_done:
+                        st.error("작업자명과 생산 내역은 필수 입력 항목입니다.")
+                    else:
+                        images_b64_list = []
+                        if log_images:
+                            for img in log_images:
+                                images_b64_list.append(base64.b64encode(img.read()).decode('utf-8'))
+
+                        new_log = {
+                            "id": datetime.now().strftime("%Y%m%d%H%M%S"),
+                            "date": log_date.strftime("%Y-%m-%d"),
+                            "worker": worker_name,
+                            "shift": shift,
+                            "machine": machine_used,
+                            "tasks": tasks_done,
+                            "issues": issues_notes,
+                            "images_b64": images_b64_list,
+                            "image_b64": "",
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+                        }
+                        db["work_logs"].append(new_log)
+                        save_data(db)
+                        st.success("작업 일지가 성공적으로 저장되었습니다!")
+                        
+        st.markdown("---")
+        st.subheader("📋 지난 작업 일지 조회")
+        
+        search_log = st.text_input("🔍 작업자명, 장비명, 또는 내용으로 검색", placeholder="검색어 입력...")
+        
+        filtered_logs = db["work_logs"]
+        if search_log:
+            filtered_logs = [
+                l for l in filtered_logs 
+                if search_log.lower() in l["worker"].lower() or 
+                   search_log.lower() in l["machine"].lower() or 
+                   search_log.lower() in l["tasks"].lower() or 
+                   search_log.lower() in l["issues"].lower()
+            ]
+            
+        if not filtered_logs:
+            st.info("등록된 작업 일지가 없습니다. 오늘의 작업을 기록해 보세요!")
+        else:
+            for log in reversed(filtered_logs):
+                with st.expander(f"📅 [{log['date']}] {log['worker']} ({log['shift']}) - {log['machine']}"):
+                    st.markdown("**🛠️ 생산 내역:**")
+                    st.write(log['tasks'])
+                    st.markdown("**⚠️ 특이사항 및 인수인계:**")
+                    st.info(log['issues'] if log['issues'] else "특이사항 없음")
+                    
+                    imgs_to_show = log.get("images_b64", [])
+                    if not imgs_to_show and log.get("image_b64"):
+                        imgs_to_show = [log["image_b64"]]
+                    
+                    if imgs_to_show:
+                        st.markdown("---")
+                        num_cols = min(len(imgs_to_show), 3)
+                        cols = st.columns(num_cols)
+                        for i, img_b64 in enumerate(imgs_to_show):
+                            img_bytes = base64.b64decode(img_b64)
+                            cols[i % num_cols].image(img_bytes, use_column_width=True)
+                    
+                    st.caption(f"작성 일시: {log['created_at']}")
+                    
+                    col_btn1, col_btn2 = st.columns([1, 1])
+                    
+                    with col_btn1:
+                        with st.expander("✏️ 일지 수정하기"):
+                            with st.form(f"edit_log_form_{log['id']}"):
+                                edit_worker = st.text_input("작업자명 수정", value=log['worker'])
+                                edit_tasks = st.text_area("생산 내역 수정", value=log['tasks'], height=100)
+                                edit_issues = st.text_area("특이사항 수정", value=log['issues'], height=100)
+                                
+                                edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{log['id']}")
+                                delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{log['id']}")
+                                
+                                if st.form_submit_button("💾 수정 저장"):
+                                    for idx, l in enumerate(db["work_logs"]):
+                                        if l["id"] == log["id"]:
+                                            db["work_logs"][idx]["worker"] = edit_worker
+                                            db["work_logs"][idx]["tasks"] = edit_tasks
+                                            db["work_logs"][idx]["issues"] = edit_issues
+                                            
+                                            if edit_images:
+                                                db["work_logs"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
+                                                db["work_logs"][idx]["image_b64"] = ""
+                                            elif delete_image:
+                                                db["work_logs"][idx]["images_b64"] = []
+                                                db["work_logs"][idx]["image_b64"] = ""
+                                            break
+                                    save_data(db)
+                                    st.rerun()
+                                    
+                    with col_btn2:
+                        if st.button("❌ 일지 삭제", key=f"del_log_{log['id']}"):
+                            db["work_logs"] = [l for l in db["work_logs"] if l["id"] != log["id"]]
+                            save_data(db)
+                            st.rerun()
+
+elif 메인메뉴 == "원영공구 (공구/소재)":
+    장부_화면_출력("🛠️ 원영공구 구매 장부", "원영공구_장부.json", ["공구", "소재"])
+
+elif 메인메뉴 == "익산비철 (비철/자재)":
+    장부_화면_출력("⛓️ 익산비철 구매 장부", "익산비철_장부.json", ["비철", "기타 자재"])
