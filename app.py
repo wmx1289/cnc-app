@@ -9,7 +9,6 @@ from datetime import datetime
 import re
 import ast
 import pandas as pd
-import ollama
 
 # 모바일 화면에서도 꽉 차게 보이도록 layout="wide", 사이드바 항상 열린 상태로 시작
 st.set_page_config(
