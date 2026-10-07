@@ -1,847 +1,742 @@
 import os
+import json
+import re
+import io
+import shutil
+import sqlite3
+import requests
+from datetime import datetime
+from pathlib import Path
+import pandas as pd
+import pdfplumber
+from PIL import Image
+import pytesseract
 import base64
-os.environ["STREAMLIT_GATHER_USAGE_STATS"] = "false"
-os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
 
 import streamlit as st
 import streamlit.components.v1 as components
-import json
-from datetime import datetime
-import re
-import ast
-import pandas as pd
-import ollama
 
-# 모바일 화면에서도 꽉 차게 보이도록 layout="wide", 사이드바 항상 열린 상태로 시작
-st.set_page_config(
-    page_title="현장 통합 관리 시스템", 
-    page_icon="⚙️", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# =====================================================================
+# [SECTION 1] 시스템 환경 및 UI 기본 설정
+# =====================================================================
+st.set_page_config(page_title="GSE 현장 통합 사무장", layout="wide", page_icon="🚀", initial_sidebar_state="expanded")
 
-# 사이드바 숨김 및 🖨️ 인쇄 최적화 커스텀 CSS
+BASE_DIR = Path("/app") if os.path.exists("/app") else Path(".")
+ALL_DATA_DIR = BASE_DIR / "all_data"
+INBOX_DIR = BASE_DIR / "inbox"
+DATA_DIR = BASE_DIR / "data"
+KNOWLEDGE_DIR = DATA_DIR / "web_knowledge"
+BACKUP_DIR = BASE_DIR / "backup"
+
+for d in [ALL_DATA_DIR, INBOX_DIR, DATA_DIR, KNOWLEDGE_DIR, BACKUP_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# 💡 모델 분리 및 최적화: 챗봇 전용 경량 모델 사용 (RTX 4060 8GB 최적화)
+CHAT_MODEL_NAME = "qwen2.5:7b" 
+
+if 'chat_history' not in st.session_state: st.session_state.chat_history = []
+
+# 인쇄용 CSS (사이드바, 툴바 등 숨김 처리)
 st.markdown(
     """
     <style>
         [data-testid="collapsedControl"] { display: none; }
-
         @media print {
-            /* 컬러 및 배경 인쇄 강제 적용 */
-            body { 
-                -webkit-print-color-adjust: exact !important; 
-                print-color-adjust: exact !important; 
-                color: black !important; 
-                background-color: white !important; 
-            }
-            
-            /* 사이드바, 헤더, 툴바 숨기기 */
-            [data-testid="stSidebar"] { display: none !important; }
-            header[data-testid="stHeader"] { display: none !important; }
-            [data-testid="stToolbar"] { display: none !important; }
-            
-            /* 폼, 버튼, 파일 업로더 등 조작 UI 요소 숨기기 */
-            .stButton { display: none !important; }
-            [data-testid="stForm"] { display: none !important; }
-            [data-testid="stFileUploader"] { display: none !important; }
-            [data-testid="stTextInput"] { display: none !important; }
-            [data-testid="stSelectbox"] { display: none !important; }
-            [data-testid="stMultiSelect"] { display: none !important; }
-            [data-testid="stTextArea"] { display: none !important; }
-            [data-testid="stNumberInput"] { display: none !important; }
-            [data-testid="stDateInput"] { display: none !important; }
-            [data-testid="stRadio"] { display: none !important; }
-            [data-testid="stCheckbox"] { display: none !important; }
-            [data-testid="stTabs"] [role="tablist"] { display: none !important; }
-            
-            /* Expander를 숨기지 않고 내용물만 깔끔히 인쇄 */
+            body { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            [data-testid="stSidebar"], header[data-testid="stHeader"], [data-testid="stToolbar"] { display: none !important; }
+            .stButton, [data-testid="stForm"], [data-testid="stFileUploader"], [data-testid="stTextInput"], 
+            [data-testid="stSelectbox"], [data-testid="stTextArea"], [data-testid="stDateInput"], 
+            [data-testid="stRadio"], [data-testid="stCheckbox"], [data-testid="stTabs"] [role="tablist"] { display: none !important; }
             [data-testid="stExpander"] details summary { display: none !important; } 
             [data-testid="stExpander"] details { border: none !important; margin-bottom: 20px !important; }
-            
-            /* 표 인쇄 최적화 */
             table { font-size: 14px !important; width: 100% !important; }
-            
-            /* 메인 화면 여백 최소화 */
-            .main .block-container { max-width: 100% !important; padding: 10px !important; }
         }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ==========================================
-# 0. 인쇄 버튼 컴포넌트 함수
-# ==========================================
 def show_print_button():
     components.html(
         """
-        <script>
-        function printPage() {
-            window.parent.print();
-        }
-        </script>
-        <style>
-        .print-btn {
-            background-color: #4CAF50; border: none; color: white;
-            padding: 10px 20px; text-align: center; text-decoration: none;
-            display: inline-block; font-size: 16px; margin: 4px 2px;
-            cursor: pointer; border-radius: 6px; font-family: sans-serif;
-            font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .print-btn:hover { background-color: #45a049; }
-        </style>
+        <script>function printPage() { window.parent.print(); }</script>
         <div style="text-align: right;">
-            <button class="print-btn" onclick="printPage()">🖨️ 실제 인쇄 / PDF 저장하기</button>
+            <button onclick="printPage()" style="background-color: #4CAF50; border: none; color: white; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold;">🖨️ 실제 인쇄 / PDF 저장하기</button>
         </div>
-        """,
-        height=60
+        """, height=60
     )
 
-# ==========================================
-# 세션 상태 초기화 (선택 인쇄 모드 관리)
-# ==========================================
-if "print_mode_setup" not in st.session_state: st.session_state.print_mode_setup = False
-if "print_mode_memo" not in st.session_state: st.session_state.print_mode_memo = False
-if "print_mode_log" not in st.session_state: st.session_state.print_mode_log = False
 
+# =====================================================================
+# [SECTION 2] 데이터베이스(SQLite) 초기화 및 백업 스위칭
+# =====================================================================
+backup_files = list(BACKUP_DIR.glob("*.db"))
+backup_names = [f.name for f in sorted(backup_files, reverse=True)]
+db_options = ["현재 사용 중인 장부 (gse_precision.db)"] + backup_names
 
-# ==========================================
-# 1. 스마트 가공 매니저용 데이터베이스 설정
-# ==========================================
-DB_FILE = "machining_db.json"
+st.sidebar.title("🏭 GSE 통합 시스템")
+selected_db_name = st.sidebar.selectbox("📂 열어볼 장부 파일(백업) 선택", db_options)
+is_backup_mode = selected_db_name != "현재 사용 중인 장부 (gse_precision.db)"
 
-GM_DICTIONARY = {
-    "G00": "급속 이송 (가공 없이 목표 위치로 빠르게 이동)",
-    "G01": "직선 절삭 이송 (F값에 지정된 속도로 직선 가공)",
-    "G02": "원호 가공 CW (시계 방향으로 둥글게 깎기)",
-    "G03": "원호 가공 CCW (반시계 방향으로 둥글게 깎기)",
-    "G04": "일시 정지 / Dwell (X 또는 P값만큼 제자리에서 대기)",
-    "G28": "기계 원점 복귀",
-    "G40": "공구 인선 반경 보정 취소 (G41, G42 취소)",
-    "G41": "공구 인선 반경 보정 - 좌측 (진행 방향 기준 왼쪽 보정)",
-    "G42": "공구 인선 반경 보정 - 우측 (진행 방향 기준 오른쪽 보정)",
-    "G43": "공구 길이 보정 + (MCT 주로 사용)",
-    "G49": "공구 길이 보정 취소",
-    "G54": "공작물 좌표계 1 (가장 많이 쓰는 기본 좌표계)",
-    "G81": "스폿 드릴링 사이클 (MCT)",
-    "G83": "심공 드릴링 사이클 (MCT - 펙드릴)",
-    "G84": "태핑 사이클 (MCT - 탭 가공)",
-    "M00": "프로그램 정지 (무조건 기계 멈춤, 시작 버튼 누르면 재시작)",
-    "M01": "선택적 정지 (기계 조작반의 '옵셔널 스톱' 켜져 있을 때만 멈춤)",
-    "M02": "프로그램 종료",
-    "M30": "프로그램 종료 및 메모리 선두로 복귀 (작업 완료)"
-}
+if is_backup_mode:
+    DB_PATH = BACKUP_DIR / selected_db_name
+    st.sidebar.error("⚠️ 과거 장부를 열람 중입니다. (조회 전용/저장 불가)")
+else:
+    DB_PATH = DATA_DIR / "gse_precision.db"
 
-def save_data(data):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-def load_data():
-    initial_data = {
-        "setup_sheets": [], 
-        "gcodes": [], 
-        "memos": [], 
-        "work_logs": [],
-        "companies": [
-            {"name": "공구", "file_prefix": "원영공구", "categories": ["공구", "소재"]},
-            {"name": "자재", "file_prefix": "익산비철", "categories": ["알미늄", "스틸", "아세탈"]},
-            {"name": "소모품", "file_prefix": "부광윤활유", "categories": ["소모품"]}
-        ]
-    }
-    if not os.path.exists(DB_FILE):
-        save_data(initial_data)
-        return initial_data
-    try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content: return initial_data
-            data = json.loads(content)
+def init_db():
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS quotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, company TEXT, 
+            part_name TEXT, material TEXT, unit_price INTEGER, quantity INTEGER, total_price INTEGER,
+            quote_date TEXT, file_path TEXT, raw_text TEXT, payment_status TEXT, due_date TEXT, estimated_hours TEXT)""")
+        
+        conn.execute("""CREATE TABLE IF NOT EXISTS tool_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, quote_date TEXT, company TEXT, 
+            category TEXT, part_name TEXT, unit_price INTEGER, quantity INTEGER, total_price INTEGER)""")
+        
+        conn.execute("""CREATE TABLE IF NOT EXISTS setup_sheets (
+            id TEXT PRIMARY KEY, quote_date TEXT, part_name TEXT, machine TEXT, category TEXT, 
+            material TEXT, g_code_coord TEXT, tool_info TEXT, knowhow TEXT, images_b64 TEXT)""")
+        
+        conn.execute("""CREATE TABLE IF NOT EXISTS quick_prompts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, prompt_text TEXT UNIQUE, category TEXT DEFAULT '기타')""")
             
-            # DB 파일 내의 companies 정보 강제 업데이트
-            data["companies"] = initial_data["companies"]
-            
-            needs_save = True
-            for key in initial_data.keys():
-                if key not in data: 
-                    data[key] = initial_data[key]
-                    needs_save = True
-            if needs_save: save_data(data)
-            return data
-    except Exception: 
-        return initial_data
-
-db = load_data()
-
-
-# ==========================================
-# 2. 공구/자재 장부용 공통 데이터 함수
-# ==========================================
-def 장부_불러오기(파일이름):
-    if os.path.exists(파일이름):
-        with open(파일이름, 'r', encoding='utf-8') as f: return json.load(f)
-    return []
-
-def 장부_저장하기(파일이름, 데이터):
-    with open(파일이름, 'w', encoding='utf-8') as f: json.dump(데이터, f, ensure_ascii=False, indent=4)
-
-def 장부_화면_출력(제목, 파일이름, 분류목록):
-    print_mode_key = f"print_mode_{제목}"
-    if print_mode_key not in st.session_state:
-        st.session_state[print_mode_key] = False
-
-    # 🖨️ 인쇄 모드일 경우 (장부 전용)
-    if st.session_state[print_mode_key]:
-        st.markdown(f"<h2 style='text-align:center;'>🖨️ {제목} 선택 항목 인쇄</h2>", unsafe_allow_html=True)
-        c1, c2 = st.columns([1, 1])
-        with c1: 
-            if st.button("⬅️ 돌아가기", key=f"back_{제목}"): 
-                st.session_state[print_mode_key] = False
-                st.rerun()
-        with c2: show_print_button()
-        st.markdown("<hr style='border: 2px solid #ccc;'/>", unsafe_allow_html=True)
+        # G코드 및 메모 테이블 추가
+        conn.execute("""CREATE TABLE IF NOT EXISTS gcodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, machine TEXT, code TEXT, description TEXT)""")
         
-        selected_indices = st.session_state.get(f"print_selected_{제목}", [])
-        if selected_indices:
-            selected_data = [st.session_state.ledger[i] for i in selected_indices]
-            print_df = pd.DataFrame(selected_data)
-            print_df.insert(0, '출력 No.', range(1, len(print_df) + 1))
-            st.table(print_df.style.format({"단가": "₩{:,}", "총액": "₩{:,}"}))
-        else:
-            st.warning("선택된 항목이 없습니다.")
-        return 
+        conn.execute("""CREATE TABLE IF NOT EXISTS memos (
+            id TEXT PRIMARY KEY, title TEXT, content TEXT, date TEXT)""")
 
-    # --- 일반 장부 화면 ---
-    c1, c2 = st.columns([3, 1])
-    with c1: st.title(제목)
-    with c2: show_print_button()
+def migrate_old_json_data():
+    if is_backup_mode: return
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        # 1. 기존 매입 장부 마이그레이션
+        for json_file in BASE_DIR.glob("*_장부.json"):
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for item in data:
+                    conn.execute("""
+                        INSERT INTO tool_ledger (quote_date, company, category, part_name, unit_price, quantity, total_price)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        item.get("일자", ""), item.get("거래처", ""), item.get("분류", "미분류"),
+                        item.get("품목명", ""), int(item.get("단가", 0)), int(item.get("수량", 0)), int(item.get("총액", 0))
+                    ))
+                os.rename(json_file, str(json_file) + ".backup")
+            except Exception:
+                pass
 
-    if 'current_menu' not in st.session_state or st.session_state.current_menu != 제목:
-        st.session_state.current_menu = 제목
-        st.session_state.ledger = 장부_불러오기(파일이름)
-        st.session_state.ai_extracted = None
-
-    tab1, tab2, tab3 = st.tabs(["월별 구매내역", "품목 통계", "새 구매 등록 (+AI)"])
-
-    with tab1:
-        st.subheader("구매내역 조회 및 수정/삭제")
-        st.info("💡 **쉬운 수정 및 삭제 방법:** \n"
-                "- **수정:** 표 안의 글자를 더블클릭하여 내용을 고친 후 아래의 **[💾 표 변경사항 저장]** 버튼을 누르세요.\n"
-                "- **삭제:** 지우고 싶은 항목 맨 앞의 **`☑️ 선택`** 칸에 체크한 뒤 **[🗑️ 선택 항목 삭제]** 버튼을 누르세요.\n"
-                "- **인쇄:** 보고서로 인쇄할 항목을 체크하고 **[🖨️ 선택 항목 출력]** 버튼을 누르세요.")
-        
-        검색어 = st.text_input("🔍 품목명 검색:", key=f"search_{제목}")
-        
-        if st.session_state.ledger:
-            df = pd.DataFrame(st.session_state.ledger)
-            if '거래처' not in df.columns:
-                df['거래처'] = ""
+        # 2. machining_db.json (셋업 시트, G코드, 메모) 마이그레이션
+        machining_json = BASE_DIR / "machining_db.json"
+        if machining_json.exists():
+            try:
+                with open(machining_json, 'r', encoding='utf-8') as f:
+                    db_data = json.load(f)
                 
-            df.insert(0, '☑️ 선택', False)
-            df.insert(1, 'No.', range(1, len(df) + 1))
-            
-            if 검색어: df = df[df['품목명'].str.contains(검색어)]
-                
-            edited_df = st.data_editor(
-                df, 
-                column_config={
-                    "☑️ 선택": st.column_config.CheckboxColumn("☑️ 선택", default=False),
-                    "분류": st.column_config.SelectboxColumn("분류", options=분류목록, required=True),
-                }, 
-                hide_index=True, 
-                num_rows="dynamic",
-                use_container_width=True,
-                disabled=["No.", "총액"] 
-            )
-            
-            # 버튼 영역 (3등분)
-            c1_btn, c2_btn, c3_btn = st.columns(3)
-            
-            with c1_btn:
-                if st.button("💾 표 변경사항 저장", type="primary", use_container_width=True, key=f"btn_save_{제목}"):
-                    new_ledger = []
-                    for _, row in edited_df.iterrows():
-                        try: 단가 = int(re.sub(r'[^0-9]', '', str(row['단가']))) if pd.notnull(row['단가']) else 0
-                        except: 단가 = 0
-                        try: 수량 = int(re.sub(r'[^0-9]', '', str(row['수량']))) if pd.notnull(row['수량']) else 1
-                        except: 수량 = 1
-                            
-                        new_ledger.append({
-                            "일자": str(row['일자'])[:10] if pd.notnull(row['일자']) else "",
-                            "거래처": str(row['거래처']) if pd.notnull(row['거래처']) else "",
-                            "분류": str(row['분류']) if pd.notnull(row['분류']) else 분류목록[0],
-                            "품목명": str(row['품목명']) if pd.notnull(row['품목명']) else "",
-                            "단가": 단가,
-                            "수량": 수량,
-                            "총액": 단가 * 수량
-                        })
-                    st.session_state.ledger = new_ledger
-                    장부_저장하기(파일이름, st.session_state.ledger)
-                    st.success("데이터가 성공적으로 업데이트되었습니다!")
-                    st.rerun()
-            
-            with c2_btn:
-                selected_count = len(edited_df[edited_df['☑️ 선택'] == True])
-                if selected_count > 0:
-                    if st.button(f"🗑️ 선택 항목({selected_count}개) 삭제", use_container_width=True, key=f"btn_del_{제목}"):
-                        # 체크되지 않은 항목들만 남김
-                        remaining_df = edited_df[edited_df['☑️ 선택'] == False]
-                        new_ledger = []
-                        for _, row in remaining_df.iterrows():
-                            try: 단가 = int(re.sub(r'[^0-9]', '', str(row['단가']))) if pd.notnull(row['단가']) else 0
-                            except: 단가 = 0
-                            try: 수량 = int(re.sub(r'[^0-9]', '', str(row['수량']))) if pd.notnull(row['수량']) else 1
-                            except: 수량 = 1
-                                
-                            new_ledger.append({
-                                "일자": str(row['일자'])[:10] if pd.notnull(row['일자']) else "",
-                                "거래처": str(row['거래처']) if pd.notnull(row['거래처']) else "",
-                                "분류": str(row['분류']) if pd.notnull(row['분류']) else 분류목록[0],
-                                "품목명": str(row['품목명']) if pd.notnull(row['품목명']) else "",
-                                "단가": 단가,
-                                "수량": 수량,
-                                "총액": 단가 * 수량
-                            })
-                        st.session_state.ledger = new_ledger
-                        장부_저장하기(파일이름, st.session_state.ledger)
-                        st.success(f"{selected_count}개의 기록이 삭제되었습니다!")
-                        st.rerun()
-                else:
-                    st.button("🗑️ 삭제할 항목을 체크하세요", disabled=True, use_container_width=True, key=f"btn_del_disabled_{제목}")
+                # 셋업 시트 복원
+                for sheet in db_data.get("setup_sheets", []):
+                    imgs = sheet.get("images_b64", [])
+                    if sheet.get("image_b64") and not imgs: imgs = [sheet.get("image_b64")]
+                    date_str = sheet.get("date", "").split(" ")[0] if sheet.get("date") else datetime.now().strftime("%Y-%m-%d")
                     
-            with c3_btn:
-                selected_original_indices = [no - 1 for no in edited_df[edited_df['☑️ 선택'] == True]['No.'] if pd.notnull(no)]
-                if len(selected_original_indices) > 0:
-                    if st.button(f"🖨️ 선택 항목({len(selected_original_indices)}개) 출력", use_container_width=True, key=f"btn_print_{제목}"):
-                        st.session_state[f"print_selected_{제목}"] = selected_original_indices
-                        st.session_state[print_mode_key] = True
-                        st.rerun()
-                else:
-                    st.button("🖨️ 인쇄할 항목을 체크하세요", disabled=True, use_container_width=True, key=f"btn_print_disabled_{제목}")
+                    conn.execute("""INSERT OR IGNORE INTO setup_sheets 
+                        (id, quote_date, part_name, machine, category, material, g_code_coord, tool_info, knowhow, images_b64) 
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""", 
+                        (sheet.get("id", ""), date_str, sheet.get("part_name", ""), sheet.get("machine", ""), 
+                         sheet.get("category", "방산/일반"), sheet.get("material", ""), sheet.get("g_code_coord", ""), 
+                         sheet.get("tool_info", ""), sheet.get("knowhow", ""), json.dumps(imgs)))
+                
+                # G코드 복원
+                for g in db_data.get("gcodes", []):
+                    conn.execute("INSERT INTO gcodes (title, machine, code, description) VALUES (?,?,?,?)",
+                                 (g.get("title", ""), g.get("machine", ""), g.get("code", ""), g.get("description", "")))
+                
+                # 가공 메모 복원
+                for m in db_data.get("memos", []):
+                    conn.execute("INSERT OR IGNORE INTO memos (id, title, content, date) VALUES (?,?,?,?)",
+                                 (m.get("id", ""), m.get("title", ""), m.get("content", ""), m.get("date", "")))
+                
+                conn.commit()
+                os.rename(machining_json, str(machining_json) + ".backup")
+            except Exception as e:
+                st.error(f"machining_db.json 불러오기 오류: {e}")
+
+init_db()
+migrate_old_json_data()
+
+
+# =====================================================================
+# [SECTION 3] 순수 Python 기반 영수증 텍스트 판독 엔진 (Vision AI 대체)
+# =====================================================================
+def extract_text_from_file(file_path):
+    text = ""
+    try:
+        suffix = file_path.suffix.lower()
+        if suffix == '.pdf':
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    text += page.extract_text() or "" + "\n"
+        elif suffix in ['.png', '.jpg', '.jpeg']:
+            # pytesseract를 이용한 이미지 OCR
+            img = Image.open(file_path)
+            text = pytesseract.image_to_string(img, lang='kor+eng')
+    except Exception as e:
+        return f"문서 읽기 오류: {str(e)}"
+    return text
+
+def parse_receipt_with_python(file_path):
+    text = extract_text_from_file(file_path)
+    item = {
+        "quote_date": datetime.now().strftime("%Y-%m-%d"),
+        "company": "미상",
+        "category": "공구",
+        "part_name": "판독 필요 (장부 센터에서 수정)",
+        "unit_price": 0,
+        "quantity": 1
+    }
+    
+    if not text or "문서 읽기 오류" in text:
+        return {"items": [item]}
+
+    try:
+        date_match = re.search(r'(20\d{2})[-./](\d{1,2})[-./](\d{1,2})', text)
+        if date_match:
+            item["quote_date"] = f"{date_match.group(1)}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}"
+        
+        company_match = re.search(r'(상\s*호|공급자|업\s*체\s*명|귀하)\s*[:;]?\s*([가-힣a-zA-Z0-9\(\)]+)', text)
+        if company_match:
+            item["company"] = company_match.group(2).strip()
+            
+        money_matches = re.findall(r'[0-9]{1,3}(?:,[0-9]{3})+', text)
+        if money_matches:
+            amounts = [int(m.replace(',', '')) for m in money_matches]
+            item["unit_price"] = max(amounts)
+    except Exception:
+        pass 
+
+    return {"items": [item]}
+
+
+# =====================================================================
+# [SECTION 4] 스마트 검색 엔진 및 AI 요약 보고
+# =====================================================================
+def extract_keywords(prompt_text):
+    current_month = str(datetime.now().month)
+    
+    text_with_month = prompt_text.replace("이번달", f"{current_month}월") \
+                                 .replace("이번 달", f"{current_month}월") \
+                                 .replace("요번달", f"{current_month}월") \
+                                 .replace("요번 달", f"{current_month}월")
+                                 
+    months = re.findall(r'(\d+)월', text_with_month)
+    
+    # 보고, 모고, 요번달 등 대거 추가
+    stop_words = [
+        "이번달", "이번", "달", "월", "월달", "보여줘", "알려줘", "보고해", "보고", "모고", 
+        "어때", "얼마야", "얼마", "내역", "총액", "총", "합계", "싹", "다", "전부", 
+        "매입", "구매", "산거", "거래", "장부", "샀어", "찾아봐", "정리해", "해줘", 
+        "은", "는", "이", "가", "을", "를", "어", "요", "야", "지", "얼만지", "요번달", "요번"
+    ]
+    
+    clean_prompt = re.sub(r'[^\w\s]', '', text_with_month)
+    words = clean_prompt.split()
+    
+    keywords = []
+    for w in words:
+        if w in stop_words:
+            continue
+        if re.match(r'^\d+(월|월달|월에)?$', w):
+            continue
+        keywords.append(w)
+        
+    return months, keywords
+
+def get_ai_briefing(user_prompt, total_sum, count):
+    system_fact = f"[파이썬 코드 제공 팩트: 조건에 맞는 데이터는 총 {count}건, 합계 금액은 {total_sum:,.0f}원입니다.]" if count > 0 else "[파이썬 코드 제공 팩트: 해당 조건에 맞는 데이터가 존재하지 않습니다.]"
+    
+    payload = {
+        "model": CHAT_MODEL_NAME, 
+        "messages": [
+            {
+                "role": "system",
+                "content": f"당신은 '지에스이정밀'의 베테랑 사무장입니다.\n{system_fact}\n사장님의 지시({user_prompt})에 대해 위 [팩트]만을 사용하여 짧고 명확하게 '보고'하십시오.\n🚨 절대 지켜야 할 규칙: 상세 내역은 이미 화면에 표로 출력되었으니, 품목을 나열하거나 임의로 숫자를 지어내지 마십시오. '사장님, 보고드립니다.'로 시작하여 2~3줄로 깔끔하게 요약만 하세요."
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        "stream": True,
+        "keep_alive": "5m", 
+        "options": {
+            "temperature": 0.2,
+            "num_gpu": -1,
+            "num_predict": 1000,
+            "num_ctx": 4096
+        }
+    }
+    
+    try:
+        def stream_generator():
+            with requests.post("http://localhost:11434/api/chat", json=payload, stream=True) as response:
+                if response.status_code != 200:
+                    yield f"Ollama 연결 에러 (모델명: {CHAT_MODEL_NAME} 설치 확인요망): {response.status_code}"
+                    return
+                for line in response.iter_lines():
+                    if line: 
+                        data = json.loads(line.decode('utf-8'))
+                        if "message" in data:
+                            yield data["message"].get("content", "")
+                        
+        return st.write_stream(stream_generator())
+    except Exception as e: 
+        return f"AI 연결 오류: {str(e)}"
+
+
+# =====================================================================
+# [SECTION 5] 앱 화면(UI) 구성 및 라우팅
+# =====================================================================
+st.sidebar.divider()
+menu = st.sidebar.radio("업무 메뉴", ["💬 1. 스마트 사무장", "📊 2. 통합 장부 센터", "🏭 3. 셋업 시트 매니저"])
+st.sidebar.divider()
+
+clicked_prompt = None
+
+# --- 사이드바 퀵 버튼 (현장 지시) ---
+st.sidebar.subheader("💡 퀵 버튼 (현장 지시)")
+tab_q_tool, tab_q_mat, tab_q_con, tab_q_etc, tab_q_add = st.sidebar.tabs(["🛠️ 공구", "🧪 소재", "🛢 소모품", "📁 기타", "➕ 등록"])
+
+with sqlite3.connect(str(DB_PATH)) as conn:
+    prompts_df = pd.read_sql_query("SELECT * FROM quick_prompts", conn)
+
+def render_quick_prompts(tab, category):
+    global clicked_prompt
+    with tab:
+        df_cat = prompts_df[prompts_df['category'] == category]
+        if df_cat.empty: st.caption("등록된 질문이 없습니다.")
+        for _, row in df_cat.iterrows():
+            c1, c2 = st.columns([5, 1])
+            if c1.button(row['prompt_text'], key=f"btn_q_{row['id']}", use_container_width=True):
+                clicked_prompt = row['prompt_text']
+            if c2.button("❌", key=f"del_q_{row['id']}"):
+                with sqlite3.connect(str(DB_PATH)) as conn: conn.execute("DELETE FROM quick_prompts WHERE id=?", (row['id'],))
+                st.rerun()
+
+render_quick_prompts(tab_q_tool, "공구")
+render_quick_prompts(tab_q_mat, "소재")
+render_quick_prompts(tab_q_con, "소모품")
+render_quick_prompts(tab_q_etc, "기타")
+
+with tab_q_add:
+    st.caption("새로운 퀵 질문 등록")
+    new_q_cat = st.radio("분류", ["공구", "소재", "소모품", "기타"], horizontal=True, label_visibility="collapsed")
+    new_q_text = st.text_area("내용", placeholder="예: 이번 달 원영공구 결제 대금 얼마야?", label_visibility="collapsed")
+    if st.button("💾 등록", use_container_width=True, type="primary", disabled=is_backup_mode):
+        if new_q_text.strip():
+            try:
+                with sqlite3.connect(str(DB_PATH)) as conn:
+                    conn.execute("INSERT INTO quick_prompts (prompt_text, category) VALUES (?,?)", (new_q_text.strip(), new_q_cat))
+                st.rerun()
+            except sqlite3.IntegrityError: st.error("이미 동일한 질문이 있습니다.")
+
+# -----------------------------------------------------
+# 메뉴 1: 스마트 사무장
+# -----------------------------------------------------
+if menu == "💬 1. 스마트 사무장":
+    st.header("💬 사무장 실시간 보고 터미널")
+    
+    with st.expander("📄 서류/영수증 간편 자동 등록 (파이썬 OCR 적용)", expanded=False):
+        if is_backup_mode:
+            st.error("⚠️ 과거 장부를 열람 중이므로 새로운 서류를 등록할 수 없습니다.")
+        else:
+            up_file = st.file_uploader("영수증이나 거래명세서 이미지/PDF를 올려주세요.", type=['png', 'jpg', 'jpeg', 'pdf'])
+            if up_file and st.button("🚀 서류 자동 분석 및 등록", type="primary"):
+                t_path = INBOX_DIR / up_file.name
+                with open(t_path, "wb") as f: f.write(up_file.getbuffer())
+                
+                with st.status("🔍 파이썬 OCR 및 정규식 엔진으로 텍스트를 추출 중입니다...", expanded=True) as status:
+                    data = parse_receipt_with_python(t_path)
+                    
+                    if data and data.get('items'):
+                        items_list = data['items']
+                        st.dataframe(pd.DataFrame(items_list), use_container_width=True)
+                        with sqlite3.connect(str(DB_PATH)) as conn:
+                            for item in items_list:
+                                u_price = int(re.sub(r'[^0-9]', '', str(item.get('unit_price', '0'))))
+                                qty = int(re.sub(r'[^0-9]', '', str(item.get('quantity', '1'))))
+                                conn.execute("INSERT INTO tool_ledger (quote_date, company, category, part_name, unit_price, quantity, total_price) VALUES (?,?,?,?,?,?,?)", 
+                                             (item.get('quote_date'), item.get('company'), item.get('category', '공구'), item.get('part_name'), u_price, qty, u_price * qty))
+                        st.success("✅ 장부 임시 저장 완료! (장부 센터 탭에서 정확한 값으로 수정해 주세요.)")
+                        status.update(state="complete")
+                    else: 
+                        st.error("⚠️ 데이터 추출 실패")
+                        status.update(state="error")
+
+    st.divider()
+    
+    # 대화 기록 출력 (텍스트 먼저, 표는 상세내역으로 접어서 출력)
+    for chat in st.session_state.chat_history:
+        with st.chat_message(chat["role"]):
+            st.markdown(chat["content"])
+            if chat.get("dataframe") is not None: 
+                with st.expander("📄 보고 근거 상세 내역"):
+                    st.dataframe(chat["dataframe"], hide_index=True, use_container_width=True)
+
+    user_input = st.chat_input("사무장에게 장부 내역을 물어보세요 (또는 왼쪽 퀵 버튼 클릭)")
+    final_prompt = user_input or clicked_prompt
+    
+    if final_prompt:
+        st.session_state.chat_history.append({"role": "user", "content": final_prompt})
+        with st.chat_message("user"): st.markdown(final_prompt)
+        
+        with st.chat_message("assistant"):
+            months, keywords = extract_keywords(final_prompt)
+            is_sales = any(w in final_prompt for w in ["매출", "발주서", "제작"])
+            table_name = "quotes" if is_sales else "tool_ledger"
+            
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                df = pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY quote_date DESC", conn)
+            
+            if not df.empty:
+                if months:
+                    df['clean_date'] = pd.to_datetime(df['quote_date'], errors='coerce')
+                    df = df[df['clean_date'].dt.month.isin([int(m) for m in months])]
+                    df = df.drop(columns=['clean_date'], errors='ignore')
+                
+                if keywords:
+                    mask = pd.Series([True] * len(df), index=df.index)
+                    for kw in keywords:
+                        kw_mask = (
+                            df['company'].astype(str).str.contains(kw, case=False, na=False) |
+                            df['part_name'].astype(str).str.contains(kw, case=False, na=False) |
+                            df['category'].astype(str).str.contains(kw, case=False, na=False)
+                        )
+                        mask = mask & kw_mask
+                    df = df[mask]
+            
+            if not df.empty:
+                df_display = df.drop(columns=['id', 'file_path', 'raw_text'], errors='ignore')
+                total_sum = df['total_price'].sum()
+                count = len(df)
+            else:
+                df_display, total_sum, count = None, 0, 0
+                
+            # 실시간 AI 타이핑
+            briefing_text = get_ai_briefing(final_prompt, total_sum, count)
+            
+            # 보고 후 상세 내역 출력
+            if df_display is not None:
+                with st.expander("📄 보고 근거 상세 내역"):
+                    st.dataframe(df_display, hide_index=True, use_container_width=True)
+
+            st.session_state.chat_history.append({"role": "assistant", "dataframe": df_display, "content": briefing_text})
+
+
+# -----------------------------------------------------
+# 메뉴 2: 통합 장부 센터
+# -----------------------------------------------------
+elif menu == "📊 2. 통합 장부 센터":
+    st.header("📊 통합 매입 장부 센터")
+    
+    if is_backup_mode:
+        st.warning(f"⚠️ 현재 [{selected_db_name}] 과거 장부를 열람하고 있습니다. 덮어쓰기 저장이 비활성화됩니다.")
+    
+    # 💡 "거래처별 정산서 출력" 탭 추가
+    tab_view, tab_edit, tab_print, tab_backup = st.tabs(["📖 전체 장부 열람", "✏ 데이터 직접 수정", "🖨️ 거래처별 정산서 출력", "💾 장부 안전 백업"])
+    
+    # 💡 장부용 한글 컬럼 설정 추가
+    ledger_column_config = {
+        "quote_date": "일자",
+        "company": "거래처",
+        "category": "분류",
+        "part_name": "품목명",
+        "unit_price": "단가",
+        "quantity": "수량",
+        "total_price": "총액"
+    }
+
+    with tab_view:
+        st.subheader("통합 매입 장부 목록")
+        sort_opt = st.radio("🔄 뷰(View) 정렬 기준", ["업체별", "날짜별(최신순)", "품목별(가나다순)"], horizontal=True)
+        with sqlite3.connect(str(DB_PATH)) as conn: df_view = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
+            
+        if not df_view.empty:
+            df_view['clean_date'] = pd.to_datetime(df_view['quote_date'], errors='coerce')
+            if sort_opt == "업체별": df_view = df_view.sort_values(by=['company', 'clean_date'], ascending=[True, False])
+            elif sort_opt == "날짜별(최신순)": df_view = df_view.sort_values(by=['clean_date'], ascending=[False])
+            else: df_view = df_view.sort_values(by=['part_name', 'clean_date'], ascending=[True, False])
+                
+            df_view = df_view.drop(columns=['clean_date', 'id'], errors='ignore')
+            show_print_button()
+            
+            # 💡 한글 컬럼명 매핑 적용
+            st.dataframe(df_view, hide_index=True, use_container_width=True, column_config=ledger_column_config)
+        else: st.info("기록된 데이터가 없습니다.")
+
+    with tab_edit:
+        st.subheader("🛠️ 장부 데이터 직접 편집")
+        sort_opt_edit = st.radio("🔄 편집 뷰(View) 정렬 기준", ["업체별", "날짜별(최신순)", "품목별(가나다순)"], horizontal=True, key="sort_edit_radio")
+        
+        with sqlite3.connect(str(DB_PATH)) as conn: 
+            df_edit = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
+            
+        if not df_edit.empty:
+            df_edit['clean_date'] = pd.to_datetime(df_edit['quote_date'], errors='coerce')
+            if sort_opt_edit == "업체별": df_edit = df_edit.sort_values(by=['company', 'clean_date'], ascending=[True, False])
+            elif sort_opt_edit == "날짜별(최신순)": df_edit = df_edit.sort_values(by=['clean_date'], ascending=[False])
+            else: df_edit = df_edit.sort_values(by=['part_name', 'clean_date'], ascending=[True, False])
+            df_edit = df_edit.drop(columns=['clean_date'], errors='ignore')
+            
+        # 💡 한글 컬럼명 매핑 적용
+        edited_tools = st.data_editor(
+            df_edit, 
+            hide_index=True, 
+            use_container_width=True, 
+            num_rows="dynamic" if not is_backup_mode else "fixed",
+            column_config=ledger_column_config
+        )
+        
+        if st.button("💾 매입 장부 덮어쓰기 저장", type="primary", disabled=is_backup_mode):
+            with sqlite3.connect(str(DB_PATH)) as conn: edited_tools.to_sql("tool_ledger", conn, if_exists="replace", index=False)
+            st.success("✅ 장부 업데이트 완료!"); st.rerun()
+
+    with tab_print:
+        st.subheader("🖨️ 거래처별 정산서 출력")
+        with sqlite3.connect(str(DB_PATH)) as conn: 
+            df_print = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
+            
+        if not df_print.empty:
+            df_print['clean_date'] = pd.to_datetime(df_print['quote_date'], errors='coerce')
+            
+            # 1단계: 거래처 및 월 선택 필터 생성
+            companies = ["전체"] + sorted(df_print['company'].dropna().unique().tolist())
+            months = ["전체"] + sorted(df_print['clean_date'].dt.month.dropna().unique().astype(int).astype(str).tolist())
+            
+            c1, c2 = st.columns(2)
+            sel_company = c1.selectbox("🏢 정산할 거래처 선택", companies)
+            sel_month = c2.selectbox("📅 정산할 월(Month) 선택", months)
+            
+            # 2단계: 데이터 필터링
+            df_filtered = df_print.copy()
+            if sel_company != "전체":
+                df_filtered = df_filtered[df_filtered['company'] == sel_company]
+            if sel_month != "전체":
+                df_filtered = df_filtered[df_filtered['clean_date'].dt.month == int(sel_month)]
+                
+            df_filtered = df_filtered.drop(columns=['clean_date', 'id'], errors='ignore')
+            
+            # 3단계: 자동 합계 계산 및 화면 구성
+            if not df_filtered.empty:
+                total_amount = df_filtered['total_price'].sum()
+                
+                # 인쇄 시 보여질 보고서 헤더 타이틀
+                report_title_company = sel_company if sel_company != "전체" else "전체 거래처"
+                report_title_month = f"{sel_month}월" if sel_month != "전체" else "전체 기간"
+                
+                st.markdown(f"### 🧾 [{report_title_company}] {report_title_month} 정산 내역")
+                st.markdown(f"#### 💰 총 결제 대상 금액: **{total_amount:,.0f} 원**")
+                
+                # 4단계: 깔끔한 인쇄 버튼 제공
+                show_print_button()
+                
+                # 💡 한글 컬럼명 매핑 적용
+                st.dataframe(df_filtered, hide_index=True, use_container_width=True, column_config=ledger_column_config)
+            else:
+                st.info("해당 조건(업체/월)에 일치하는 데이터가 없습니다.")
         else:
             st.info("기록된 데이터가 없습니다.")
 
-    with tab2:
-        st.subheader("분류별 구매 통계")
-        if st.session_state.ledger:
-            df = pd.DataFrame(st.session_state.ledger)
-            cat_tabs = st.tabs(분류목록)
-            for i, cat in enumerate(분류목록):
-                with cat_tabs[i]:
-                    cat_df = df[df['분류'] == cat]
-                    if not cat_df.empty:
-                        stats = cat_df.groupby('품목명').agg({'수량': 'sum', '총액': 'sum'}).reset_index()
-                        st.dataframe(stats.style.format({"총액": "₩{:,}"}), use_container_width=True)
-                    else: st.write(f"내역이 없습니다.")
-
-    with tab3:
-        st.subheader("📝 새 구매 내역 등록")
-        with st.expander("📸 영수증 사진 자동 입력 (EasyOCR + LLM)", expanded=False):
-            uploaded_file = st.file_uploader("영수증 이미지 업로드", type=['jpg', 'jpeg', 'png'], key=f"img_{제목}")
-            if uploaded_file is not None:
-                if st.button("분석 시작", key=f"ai_btn_{제목}"):
-                    with st.spinner('분석 중...'):
-                        try:
-                            import easyocr
-                            reader = easyocr.Reader(['ko', 'en'])
-                            추출된_원문 = "\n".join(reader.readtext(uploaded_file.read(), detail=0))
-                            if 추출된_원문.strip():
-                                프롬프트 = f"""텍스트 분석: {추출된_원문}\n분류는 {분류목록} 중 하나. 숫자는 쉼표 없이.\n양식: {{"일자":"YYYY-MM-DD","거래처":"회사명","분류":"{분류목록[0]}","품목명":"이름","단가":0,"수량":0}}"""
-                                응답 = ollama.chat(model='llama3.2-vision', messages=[{'role':'user','content':프롬프트}], format='json')
-                                json_match = re.search(r'\{.*?\}', 응답['message']['content'].strip(), re.DOTALL)
-                                추출된_텍스트 = json_match.group(0) if json_match else "{" + 응답['message']['content'] + "}"
-                                try: st.session_state.ai_extracted = json.loads(추출된_텍스트)
-                                except Exception: st.session_state.ai_extracted = ast.literal_eval(추출된_텍스트)
-                                st.success("분석 완료!")
-                            else: st.error("글자 인식 실패")
-                        except Exception as e: st.error(f"오류: {e}")
-                        
-        with st.form(f"form_{제목}"):
-            ai_data = st.session_state.ai_extracted or {}
-            default_date = datetime.now().date()
-            if ai_data.get("일자"):
-                try: default_date = datetime.strptime(ai_data["일자"], "%Y-%m-%d").date()
-                except: pass
-            
-            c_date, c_company = st.columns(2)
-            with c_date: 입력_일자 = st.date_input("구매 일자", value=default_date)
-            with c_company: 입력_거래처 = st.text_input("거래처 (회사명)", value=ai_data.get("거래처", ""))
-                
-            기본분류 = 분류목록.index(ai_data.get("분류")) if ai_data.get("분류") in 분류목록 else 0
-            입력_분류 = st.radio("분류 선택", 분류목록, index=기본분류, horizontal=True)
-            입력_품목명 = st.text_input("품목명", value=ai_data.get("품목명", ""))
-            단가_정리 = re.sub(r'[^0-9]', '', str(ai_data.get("단가", "")))
-            수량_정리 = re.sub(r'[^0-9]', '', str(ai_data.get("수량", "")))
-            c1, c2 = st.columns(2)
-            with c1: 입력_단가 = st.text_input("단가", value=단가_정리)
-            with c2: 입력_수량 = st.text_input("수량", value=수량_정리 if 수량_정리 else "1")
-            
-            if st.form_submit_button("장부에 등록하기", type="primary"):
-                if not 입력_품목명 or not 입력_단가 or not 입력_수량:
-                    st.warning("모두 입력해 주세요.")
-                else:
-                    try:
-                        새기록 = {
-                            "일자": 입력_일자.strftime("%Y-%m-%d"), 
-                            "거래처": 입력_거래처,
-                            "분류": 입력_분류, 
-                            "품목명": 입력_품목명, 
-                            "단가": int(입력_단가), 
-                            "수량": int(입력_수량), 
-                            "총액": int(입력_단가) * int(입력_수량)
-                        }
-                        st.session_state.ledger.append(새기록)
-                        장부_저장하기(파일이름, st.session_state.ledger)
-                        st.session_state.ai_extracted = None
-                        st.success("저장 완료!")
-                        st.rerun()
-                    except ValueError: 
-                        st.error("입력 오류. 단가와 수량은 숫자만 적어주세요.")
-
-
-# ==========================================
-# 3. 사이드바 메인 라우팅 (동적 거래처 메뉴 추가)
-# ==========================================
-st.sidebar.title("🗂️ 통합 시스템")
-
-# DB에 저장된 거래처 목록을 라디오 버튼 옵션에 추가
-menu_options = ["스마트 가공 매니저"] + [comp["name"] for comp in db.get("companies", [])]
-메인메뉴 = st.sidebar.radio("대분류 선택:", menu_options)
-
-st.sidebar.markdown("---")
-# 새 거래처 추가 및 삭제 관리 폼
-with st.sidebar.expander("➕ 새 거래처 장부 추가 및 관리"):
-    with st.form("add_company_form", clear_on_submit=True):
-        st.markdown("**새 거래처 추가**")
-        new_comp_name = st.text_input("목록에 표시될 이름", placeholder="예: 성우철강 (철판/파이프)")
-        new_comp_prefix = st.text_input("장부 파일 이름", placeholder="예: 성우철강")
-        new_comp_cats = st.text_input("품목 분류 (쉼표로 구분)", placeholder="예: 철판, 파이프, 기타")
+    with tab_backup:
+        st.subheader("💾 월별 장부 안전 백업 (스냅샷)")
+        st.write("월말 결산 후 아래 버튼을 눌러 장부 전체를 백업해 두시면, 다음 달에도 과거 기록을 안전하게 열람할 수 있습니다.")
         
-        if st.form_submit_button("추가하기"):
-            if new_comp_name and new_comp_prefix and new_comp_cats:
-                cats = [c.strip() for c in new_comp_cats.split(",") if c.strip()]
-                db["companies"].append({
-                    "name": new_comp_name,
-                    "file_prefix": new_comp_prefix,
-                    "categories": cats
-                })
-                save_data(db)
-                st.success(f"{new_comp_name} 추가 완료!")
+        custom_backup_name = st.text_input("📝 백업 파일명 지정 (선택사항)", placeholder="예: 9월달 원영공구 매입장부 (빈칸이면 날짜로 자동 저장)")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🚀 월말 장부 수동/자동 백업 생성", type="primary", use_container_width=True, disabled=is_backup_mode):
+                now_str = datetime.now().strftime('%Y%m%d_%H%M%S') 
+                input_name = custom_backup_name.strip()
+                if input_name:
+                    backup_filename = input_name if input_name.endswith(".db") else f"{input_name}.db"
+                else:
+                    backup_filename = f"장부백업_{now_str}.db"
+                    
+                shutil.copy2(str(DB_PATH), str(BACKUP_DIR / backup_filename))
+                st.success(f"✅ [{backup_filename}] 스냅샷 생성 완료! (좌측 사이드바에서 즉시 열람 가능)")
                 st.rerun()
-            else:
-                st.error("모든 항목을 입력해주세요.")
                 
-    if len(db.get("companies", [])) > 2:
-        st.markdown("<br>**🗑️ 기존 거래처 삭제**", unsafe_allow_html=True)
-        del_comp = st.selectbox("삭제할 거래처 선택", [c["name"] for c in db["companies"]])
-        if st.button("삭제", type="primary"):
-            db["companies"] = [c for c in db["companies"] if c["name"] != del_comp]
-            save_data(db)
-            st.rerun()
+        with c2:
+            try:
+                with open(DB_PATH, "rb") as f: db_bytes = f.read()
+                st.download_button("💾 외부 저장소(USB)로 직접 다운로드", db_bytes, f"gse_장부_{datetime.now().strftime('%Y%m%d')}.db", "application/octet-stream", use_container_width=True)
+            except Exception: st.warning("다운로드 할 수 없습니다.")
 
-# ---------------------------------------------------------
-# 가공 매니저 혹은 동적 장부 라우팅
-# ---------------------------------------------------------
-if 메인메뉴 == "스마트 가공 매니저":
-    st.sidebar.markdown("---")
-    가공메뉴 = st.sidebar.radio(
-        "스마트 가공 매니저 하위메뉴",
-        ["📋 스마트 셋업 시트 작성", "🔍 셋업 시트 검색/조회", "💾 자주 쓰는 G코드 매니저", "📝 현장 수기 노트 / 자유 메모", "📅 일일 작업 일지"],
-        label_visibility="collapsed"
-    )
-
-    # ---------------------------------------------------------
-    # 스마트 셋업 시트 작성
-    # ---------------------------------------------------------
-    if 가공메뉴 == "📋 스마트 셋업 시트 작성":
-        st.header("📋 신규 스마트 셋업 시트 작성")
-        st.write("현장에서 가공한 제품의 세팅 정보와 마스터캠 주의사항을 기록합니다.")
-        with st.form("setup_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                part_name = st.text_input("📦 품명 / 품번")
-                machine = st.selectbox("📟 가공 장비", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
-                category = st.selectbox("🛡️ 제품 분류", ["방산 부품", "반도체 장비부품", "산업 부품", "기타"])
-            with c2:
-                material = st.text_input("🧪 소재 재질")
-                g_code_coord = st.text_input("📍 작업 좌표계")
+# -----------------------------------------------------
+# 메뉴 3: 셋업 시트 매니저 (더블클릭 데이터 편집 기능 적용)
+# -----------------------------------------------------
+elif menu == "🏭 3. 셋업 시트 매니저":
+    st.header("📋 스마트 셋업 시트 관리")
+    
+    # 셋업 시트, G코드, 메모 탭 구성
+    tab_sheet, tab_gcode, tab_memo = st.tabs(["📋 셋업 시트", "⚙️ G코드 보관함", "📝 가공 메모"])
+    
+    # --- 1. 셋업 시트 탭 ---
+    with tab_sheet:
+        with st.expander("➕ 신규 셋업 시트 작성"):
+            with st.form("setup_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                part_name = c1.text_input("📦 품번/품명")
+                machine = c1.selectbox("📟 장비", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
+                material = c2.text_input("🧪 재질")
+                g_code_coord = c2.text_input("📍 좌표계 (G54 등)")
+                tool_info = st.text_area("공구 리스트")
+                knowhow = st.text_area("💡 가공 노하우 / 주의사항")
+                images = st.file_uploader("📷 세팅 사진", accept_multiple_files=True)
                 
-            tool_info = st.text_area("공구 리스트 (번호 / 공구명 / 조건 등)", height=150)
-            knowhow = st.text_area("💡 마스터캠 툴패스 설정 및 현장 가공 노하우 (주의사항)", height=170)
-            setup_images = st.file_uploader("📷 세팅 사진 첨부", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+                if st.form_submit_button("💾 셋업 시트 저장", disabled=is_backup_mode):
+                    if part_name.strip():
+                        sheet_id = datetime.now().strftime("%Y%m%d%H%M%S")
+                        imgs_b64 = json.dumps([base64.b64encode(i.read()).decode() for i in images]) if images else "[]"
+                        with sqlite3.connect(str(DB_PATH)) as conn:
+                            conn.execute("INSERT INTO setup_sheets (id, quote_date, part_name, machine, category, material, g_code_coord, tool_info, knowhow, images_b64) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                        (sheet_id, datetime.now().strftime("%Y-%m-%d"), part_name, machine, "방산/일반", material, g_code_coord, tool_info, knowhow, imgs_b64))
+                        st.success("✅ 저장 완료!")
+                        st.rerun()
+                    else:
+                        st.error("⚠️ 품번/품명을 입력해주세요.")
+
+        with sqlite3.connect(str(DB_PATH)) as conn: 
+            # 💡 기존에는 일부 컬럼만 불러왔으나, 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
+            df_setup = pd.read_sql_query("SELECT * FROM setup_sheets ORDER BY id DESC", conn)
+        
+        if not df_setup.empty:
+            st.write("🔍 **저장된 셋업 시트 기록 (표의 셀을 더블 클릭하여 수정하세요)**")
             
-            if st.form_submit_button("💾 셋업 시트 저장하기"):
-                if not part_name: st.error("품명은 필수입니다.")
-                else:
-                    imgs = [base64.b64encode(i.read()).decode('utf-8') for i in setup_images] if setup_images else []
-                    new_sheet = {"id": datetime.now().strftime("%Y%m%d%H%M%S"), "part_name": part_name, "machine": machine, "category": category, "material": material, "g_code_coord": g_code_coord, "tool_info": tool_info, "knowhow": knowhow, "images_b64": imgs, "image_b64": "", "date": datetime.now().strftime("%Y-%m-%d %H:%M")}
-                    db["setup_sheets"].append(new_sheet)
-                    save_data(db)
-                    st.success("저장 완료!")
-
-    # ---------------------------------------------------------
-    # 셋업 시트 검색/조회
-    # ---------------------------------------------------------
-    elif 가공메뉴 == "🔍 셋업 시트 검색/조회":
-        if st.session_state.print_mode_setup:
-            st.markdown("<h2 style='text-align:center;'>🖨️ 선택된 셋업 시트 인쇄 미리보기</h2>", unsafe_allow_html=True)
-            c1, c2 = st.columns([1, 1])
-            with c1: 
-                if st.button("⬅️ 돌아가기 (선택 해제 안됨)"): 
-                    st.session_state.print_mode_setup = False
-                    st.rerun()
-            with c2: show_print_button()
-            st.markdown("<hr style='border: 2px solid #ccc;'/>", unsafe_allow_html=True)
+            edited_setup = st.data_editor(
+                df_setup, 
+                hide_index=True, 
+                use_container_width=True,
+                num_rows="dynamic" if not is_backup_mode else "fixed",
+                column_config={
+                    "id": st.column_config.TextColumn("ID (수정불가)", disabled=True),
+                    "quote_date": "등록일자",
+                    "part_name": "품번/품명",
+                    "machine": "장비",
+                    "category": "분류",
+                    "material": "재질",
+                    "g_code_coord": "좌표계",
+                    "tool_info": "공구정보",
+                    "knowhow": "노하우/주의사항",
+                    "images_b64": st.column_config.TextColumn("이미지 데이터 (수정불가)", disabled=True)
+                }
+            )
             
-            # 명시적으로 저장한 세션 변수로 필터링
-            selected_sheets = [s for s in db["setup_sheets"] if s['id'] in st.session_state.get("selected_print_setup", [])]
-            for sheet in selected_sheets:
-                st.markdown(f"### 📦 [{sheet['machine']}] {sheet['part_name']} <span style='font-size:14px; color:gray;'>({sheet['date']})</span>", unsafe_allow_html=True)
-                tc1, tc2, tc3 = st.columns(3)
-                tc1.markdown(f"**분류:** {sheet['category']}")
-                tc2.markdown(f"**재질:** {sheet['material']}")
-                tc3.markdown(f"**좌표계:** {sheet['g_code_coord']}")
-                st.markdown("**🛠️ 공구 세팅 정보**")
-                st.code(sheet['tool_info'] if sheet['tool_info'] else "정보 없음")
-                st.markdown("**💡 가공 노하우 / 주의사항**")
-                st.info(sheet['knowhow'] if sheet['knowhow'] else "정보 없음")
-                
-                imgs = sheet.get("images_b64", [])
-                if not imgs and sheet.get("image_b64"): imgs = [sheet["image_b64"]]
-                if imgs:
-                    cols = st.columns(min(len(imgs), 3))
-                    for i, img_b64 in enumerate(imgs):
-                        cols[i % min(len(imgs), 3)].image(base64.b64decode(img_b64), use_column_width=True)
-                st.markdown("<hr style='border: 1px dashed #ccc;'/>", unsafe_allow_html=True)
+            if st.button("💾 셋업 시트 덮어쓰기 저장", key="save_setup", disabled=is_backup_mode):
+                with sqlite3.connect(str(DB_PATH)) as conn:
+                    edited_setup.to_sql("setup_sheets", conn, if_exists="replace", index=False)
+                st.success("✅ 셋업 시트 업데이트 완료!")
+                st.rerun()
 
+    # --- 2. G코드 보관함 탭 ---
+    with tab_gcode:
+        st.subheader("⚙️ 저장된 G코드 매크로")
+        
+        with st.expander("➕ 신규 G코드 작성"):
+            with st.form("gcode_form", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                g_title = c1.text_input("📌 G코드 제목", placeholder="예: MCT 주축 예열 프로그램")
+                g_machine = c2.selectbox("📟 적용 장비", ["공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
+                g_code = st.text_area("💻 G코드 내용", height=150, placeholder="G코드를 여기에 붙여넣으세요.")
+                g_desc = st.text_area("💡 설명 / 주의사항", placeholder="이 코드를 사용할 때 주의할 점을 적어주세요.")
+                
+                if st.form_submit_button("💾 G코드 저장", disabled=is_backup_mode):
+                    if g_title.strip() and g_code.strip():
+                        with sqlite3.connect(str(DB_PATH)) as conn:
+                            conn.execute("INSERT INTO gcodes (title, machine, code, description) VALUES (?,?,?,?)",
+                                         (g_title, g_machine, g_code, g_desc))
+                        st.success("✅ G코드 저장 완료!")
+                        st.rerun()
+                    else:
+                        st.error("⚠️ 제목과 G코드 내용을 모두 입력해주세요.")
+        
+        with sqlite3.connect(str(DB_PATH)) as conn: 
+            # 💡 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
+            df_gcode = pd.read_sql_query("SELECT * FROM gcodes", conn)
+            
+        if not df_gcode.empty:
+            st.write("🔍 **저장된 G코드 기록 (표의 셀을 더블 클릭하여 수정하세요)**")
+            
+            edited_gcode = st.data_editor(
+                df_gcode, 
+                hide_index=True, 
+                use_container_width=True,
+                num_rows="dynamic" if not is_backup_mode else "fixed",
+                column_config={
+                    "id": st.column_config.NumberColumn("ID (수정불가)", disabled=True),
+                    "title": "제목",
+                    "machine": "적용 장비",
+                    "code": "G코드",
+                    "description": "설명"
+                }
+            )
+            
+            if st.button("💾 G코드 덮어쓰기 저장", key="save_gcode", disabled=is_backup_mode):
+                with sqlite3.connect(str(DB_PATH)) as conn: 
+                    edited_gcode.to_sql("gcodes", conn, if_exists="replace", index=False)
+                st.success("✅ G코드 업데이트 완료!")
+                st.rerun()
         else:
-            st.header("🔍 저장된 셋업 시트 검색")
-            selected_count = sum(1 for s in db["setup_sheets"] if st.session_state.get(f"print_setup_{s['id']}", False))
-            c1, c2 = st.columns([3, 1])
-            with c1: st.info("💡 **출력 팁:** 인쇄할 시트 안의 `🖨️ 인쇄 선택` 체크박스를 체크한 후 우측의 버튼을 클릭하세요!")
-            with c2:
-                if selected_count > 0:
-                    if st.button(f"🖨️ 선택 항목({selected_count}개) 인쇄", type="primary", use_container_width=True):
-                        st.session_state.selected_print_setup = [s['id'] for s in db["setup_sheets"] if st.session_state.get(f"print_setup_{s['id']}", False)]
-                        st.session_state.print_mode_setup = True
-                        st.rerun()
-                else:
-                    st.button("🖨️ 항목을 선택해주세요", disabled=True, use_container_width=True)
-
-            search_query = st.text_input("🔍 품명, 재질, 키워드로 검색")
-            col1, col2 = st.columns(2)
-            with col1: filter_machine = st.multiselect("장비 필터", ["두산 DNM500", "두산 DNM650", "두산 GT2100"])
-            with col2: filter_cat = st.multiselect("분류 필터", ["방산 부품", "반도체 장비부품", "산업 부품", "기타"])
-                
-            filtered_sheets = db["setup_sheets"]
-            if search_query:
-                filtered_sheets = [s for s in filtered_sheets if search_query.lower() in s["part_name"].lower() or search_query.lower() in s["material"].lower() or search_query.lower() in s["knowhow"].lower()]
-            if filter_machine: filtered_sheets = [s for s in filtered_sheets if s["machine"] in filter_machine]
-            if filter_cat: filtered_sheets = [s for s in filtered_sheets if s["category"] in filter_cat]
-                
-            st.markdown(f"**총 {len(filtered_sheets)}건**")
-            for sheet in reversed(filtered_sheets):
-                with st.expander(f"📦 [{sheet['machine']}] {sheet['part_name']} ({sheet['date']})"):
-                    st.checkbox("🖨️ 이 셋업 시트 인쇄 선택", key=f"print_setup_{sheet['id']}")
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.markdown(f"**분류:** {sheet['category']}")
-                    c2.markdown(f"**재질:** {sheet['material']}")
-                    c3.markdown(f"**좌표계:** {sheet['g_code_coord']}")
-                    st.markdown("**🛠️ 공구 세팅 정보**")
-                    st.code(sheet['tool_info'] if sheet['tool_info'] else "정보 없음")
-                    st.markdown("**💡 가공 노하우**")
-                    st.info(sheet['knowhow'] if sheet['knowhow'] else "정보 없음")
-                    
-                    imgs = sheet.get("images_b64", [])
-                    if not imgs and sheet.get("image_b64"): imgs = [sheet["image_b64"]]
-                    if imgs:
-                        cols = st.columns(min(len(imgs), 3))
-                        for i, img_b64 in enumerate(imgs): cols[i % min(len(imgs), 3)].image(base64.b64decode(img_b64), use_column_width=True)
-                    
-                    col_btn1, col_btn2 = st.columns([1, 1])
-                    with col_btn2:
-                        if st.button("❌ 시트 삭제", key=f"del_{sheet['id']}"):
-                            db["setup_sheets"] = [s for s in db["setup_sheets"] if s["id"] != sheet["id"]]
-                            save_data(db)
-                            st.rerun()
-
-    # ---------------------------------------------------------
-    # 자주 쓰는 G코드 매니저
-    # ---------------------------------------------------------
-    elif 가공메뉴 == "💾 자주 쓰는 G코드 매니저":
-        c1, c2 = st.columns([3, 1])
-        with c1: st.header("💾 자주 쓰는 G코드 & 수기 매크로")
-        with c2: show_print_button()
-        
-        st.subheader("📖 현장 G/M코드 기본 사전")
-        
-        dict_query = st.text_input("🔍 모르는 코드 번호나 한글 기능 검색", placeholder="예: M30, M29, 리지드, 탭...").strip()
-        
-        if dict_query:
-            found = False
-            q_upper = dict_query.upper()
-            if len(q_upper) == 2 and q_upper[0] in ['G', 'M']: q_upper = f"{q_upper[0]}0{q_upper[1]}"
-            for code, desc in GM_DICTIONARY.items():
-                if q_upper in code or dict_query in desc:
-                    st.info(f"**{code}** : {desc}")
-                    found = True
-            if not found: st.warning("검색 결과가 없습니다.")
-                
-        st.markdown("---")
-        st.subheader("⚙️ 내 전용 매크로 & 세팅 블록 관리")
-        
-        with st.expander("➕ 새로운 매크로 패턴 등록하기"):
-            with st.form("gcode_form"):
-                g_title = st.text_input("명칭")
-                g_machine = st.selectbox("장비", ["공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
-                g_code = st.text_area("코드 내용")
-                g_desc = st.text_input("설명")
-                if st.form_submit_button("저장하기"):
-                    if g_title and g_code:
-                        db["gcodes"].append({"title": g_title, "machine": g_machine, "code": g_code, "description": g_desc})
-                        save_data(db)
-                        st.success("등록 완료!")
-                        st.rerun()
-                        
-        for idx, g in enumerate(db["gcodes"]):
-            col_g1, col_g2 = st.columns([3, 1])
-            with col_g1:
-                st.markdown(f"#### 📌 {g['title']}")
-                st.caption(f"장비: {g['machine']} | 설명: {g['description']}")
-            with col_g2:
-                if st.button("🗑️ 삭제", key=f"del_g_{idx}"):
-                    db["gcodes"].pop(idx)
-                    save_data(db)
-                    st.rerun()
-            st.code(g["code"], language="glsl")
-
-    # ---------------------------------------------------------
-    # 현장 수기 노트 / 자유 메모
-    # ---------------------------------------------------------
-    elif 가공메뉴 == "📝 현장 수기 노트 / 자유 메모":
-        if st.session_state.print_mode_memo:
-            st.markdown("<h2 style='text-align:center;'>🖨️ 선택된 수기 노트 인쇄 미리보기</h2>", unsafe_allow_html=True)
-            c1, c2 = st.columns([1, 1])
-            with c1: 
-                if st.button("⬅️ 돌아가기"): 
-                    st.session_state.print_mode_memo = False
-                    st.rerun()
-            with c2: show_print_button()
-            st.markdown("<hr style='border: 2px solid #ccc;'/>", unsafe_allow_html=True)
+            st.info("등록된 G코드가 없습니다.")
             
-            # 명시적으로 저장한 세션 변수로 필터링
-            selected_memos = [m for m in db["memos"] if m['id'] in st.session_state.get("selected_print_memo", [])]
-            for memo in selected_memos:
-                st.markdown(f"### 📔 {memo['title']} <span style='font-size:14px; color:gray;'>({memo['date']})</span>", unsafe_allow_html=True)
-                st.write(memo['content'])
-                imgs = memo.get("images_b64", [])
-                if not imgs and memo.get("image_b64"): imgs = [memo["image_b64"]]
-                if imgs:
-                    cols = st.columns(min(len(imgs), 3))
-                    for i, img_b64 in enumerate(imgs): cols[i % min(len(imgs), 3)].image(base64.b64decode(img_b64), use_column_width=True)
-                st.markdown("<hr style='border: 1px dashed #ccc;'/>", unsafe_allow_html=True)
+    # --- 3. 가공 메모 탭 ---
+    with tab_memo:
+        st.subheader("📝 가공 노하우 및 메모")
+        
+        with st.expander("➕ 신규 메모 작성"):
+            with st.form("memo_form", clear_on_submit=True):
+                m_title = st.text_input("📌 메모 제목", placeholder="예: 평면 가공 시 유의사항")
+                m_content = st.text_area("📝 메모 내용", height=200, placeholder="노하우나 메모할 내용을 적어주세요.")
                 
-        else:
-            st.header("📝 현장 수기 노트 및 자유 메모")
-            with st.expander("➕ 새 노트 작성하기"):
-                with st.form("memo_form", clear_on_submit=True):
-                    memo_title = st.text_input("제목")
-                    memo_content = st.text_area("내용")
-                    uploaded_images = st.file_uploader("📷 사진 첨부", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-                    if st.form_submit_button("💾 메모 저장하기"):
-                        if memo_title and memo_content:
-                            imgs = [base64.b64encode(i.read()).decode('utf-8') for i in uploaded_images] if uploaded_images else []
-                            db["memos"].append({"id": datetime.now().strftime("%Y%m%d%H%M%S"), "title": memo_title, "content": memo_content, "images_b64": imgs, "image_b64": "", "date": datetime.now().strftime("%Y-%m-%d %H:%M")})
-                            save_data(db)
-                            st.success("저장되었습니다!")
-                            st.rerun()
-
-            st.markdown("---")
-            selected_count = sum(1 for m in db["memos"] if st.session_state.get(f"print_memo_{m['id']}", False))
-            c1, c2 = st.columns([3, 1])
-            with c1: st.info("💡 **출력 팁:** 인쇄할 노트의 `🖨️ 인쇄 선택` 체크박스를 체크한 후 우측의 버튼을 클릭하세요!")
-            with c2:
-                if selected_count > 0:
-                    if st.button(f"🖨️ 선택 항목({selected_count}개) 인쇄", type="primary", use_container_width=True):
-                        # 리렌더링 전에 체크된 ID들을 세션에 저장
-                        st.session_state.selected_print_memo = [m['id'] for m in db["memos"] if st.session_state.get(f"print_memo_{m['id']}", False)]
-                        st.session_state.print_mode_memo = True
+                if st.form_submit_button("💾 메모 저장", disabled=is_backup_mode):
+                    if m_title.strip() and m_content.strip():
+                        m_id = datetime.now().strftime("%Y%m%d%H%M%S")
+                        m_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        with sqlite3.connect(str(DB_PATH)) as conn:
+                            conn.execute("INSERT INTO memos (id, title, content, date) VALUES (?,?,?,?)",
+                                         (m_id, m_title, m_content, m_date))
+                        st.success("✅ 메모 저장 완료!")
                         st.rerun()
-                else:
-                    st.button("🖨️ 항목을 선택해주세요", disabled=True, use_container_width=True)
-
-            search_memo = st.text_input("🔍 노트 검색")
-            filtered_memos = db["memos"]
-            if search_memo: filtered_memos = [m for m in filtered_memos if search_memo.lower() in m["title"].lower() or search_memo.lower() in m["content"].lower()]
-                
-            for memo in reversed(filtered_memos):
-                with st.expander(f"📔 {memo['title']} ({memo['date']})"):
-                    st.checkbox("🖨️ 이 노트 인쇄 선택", key=f"print_memo_{memo['id']}")
-                    st.write(memo['content'])
-                    
-                    imgs = memo.get("images_b64", [])
-                    if not imgs and memo.get("image_b64"): imgs = [memo["image_b64"]]
-                    if imgs:
-                        cols = st.columns(min(len(imgs), 3))
-                        for i, img_b64 in enumerate(imgs): cols[i % min(len(imgs), 3)].image(base64.b64decode(img_b64), use_column_width=True)
+                    else:
+                        st.error("⚠️ 제목과 메모 내용을 모두 입력해주세요.")
                         
-                    col_btn1, col_btn2 = st.columns([1, 1])
-                    with col_btn1:
-                        with st.expander("✏️ 문서 수정하기"):
-                            with st.form(f"edit_memo_form_{memo['id']}"):
-                                edit_title = st.text_input("제목 수정", value=memo['title'])
-                                edit_content = st.text_area("내용 수정", value=memo['content'], height=200)
-                                
-                                edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{memo['id']}")
-                                delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{memo['id']}")
-                                
-                                if st.form_submit_button("💾 수정 저장"):
-                                    for idx, m in enumerate(db["memos"]):
-                                        if m["id"] == memo["id"]:
-                                            db["memos"][idx]["title"] = edit_title
-                                            db["memos"][idx]["content"] = edit_content
-                                            
-                                            if edit_images:
-                                                db["memos"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
-                                                db["memos"][idx]["image_b64"] = ""
-                                            elif delete_image:
-                                                db["memos"][idx]["images_b64"] = []
-                                                db["memos"][idx]["image_b64"] = ""
-                                                
-                                            db["memos"][idx]["date"] = datetime.now().strftime("%Y-%m-%d %H:%M") + " (수정됨)"
-                                            break
-                                    save_data(db)
-                                    st.rerun()
-                    with col_btn2:
-                        if st.button("❌ 문서 삭제", key=f"del_memo_{memo['id']}"):
-                            db["memos"] = [m for m in db["memos"] if m["id"] != memo["id"]]
-                            save_data(db)
-                            st.rerun()
-
-    # ---------------------------------------------------------
-    # 일일 작업 일지
-    # ---------------------------------------------------------
-    elif 가공메뉴 == "📅 일일 작업 일지":
-        if st.session_state.print_mode_log:
-            st.markdown("<h2 style='text-align:center;'>🖨️ 선택된 작업 일지 보고서</h2>", unsafe_allow_html=True)
-            c1, c2 = st.columns([1, 1])
-            with c1: 
-                if st.button("⬅️ 돌아가기"): 
-                    st.session_state.print_mode_log = False
-                    st.rerun()
-            with c2: show_print_button()
-            st.markdown("<hr style='border: 2px solid #ccc;'/>", unsafe_allow_html=True)
+        with sqlite3.connect(str(DB_PATH)) as conn: 
+            # 💡 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
+            df_memo = pd.read_sql_query("SELECT * FROM memos ORDER BY date DESC", conn)
             
-            # 명시적으로 저장한 세션 변수로 필터링
-            selected_logs = [l for l in db["work_logs"] if l['id'] in st.session_state.get("selected_print_log", [])]
-            for log in selected_logs:
-                st.markdown(f"### 📅 [{log['date']}] {log['worker']} ({log['shift']}) - {log['machine']}")
-                st.markdown("**🛠️ 생산 내역:**")
-                st.write(log['tasks'])
-                st.markdown("**⚠️ 특이사항 및 인수인계:**")
-                st.info(log['issues'] if log['issues'] else "특이사항 없음")
-                
-                imgs = log.get("images_b64", [])
-                if not imgs and log.get("image_b64"): imgs = [log["image_b64"]]
-                if imgs:
-                    cols = st.columns(min(len(imgs), 3))
-                    for i, img_b64 in enumerate(imgs): cols[i % min(len(imgs), 3)].image(base64.b64decode(img_b64), use_column_width=True)
-                st.caption(f"작성 일시: {log['created_at']}")
-                st.markdown("<hr style='border: 1px dashed #ccc;'/>", unsafe_allow_html=True)
-
+        if not df_memo.empty:
+            st.write("🔍 **저장된 메모 기록 (표의 셀을 더블 클릭하여 수정하세요)**")
+            
+            edited_memo = st.data_editor(
+                df_memo, 
+                hide_index=True, 
+                use_container_width=True,
+                num_rows="dynamic" if not is_backup_mode else "fixed",
+                column_config={
+                    "id": st.column_config.TextColumn("ID (수정불가)", disabled=True),
+                    "title": "제목",
+                    "content": "메모 내용",
+                    "date": "작성/수정일"
+                }
+            )
+            
+            if st.button("💾 메모 덮어쓰기 저장", key="save_memo", disabled=is_backup_mode):
+                with sqlite3.connect(str(DB_PATH)) as conn: 
+                    edited_memo.to_sql("memos", conn, if_exists="replace", index=False)
+                st.success("✅ 메모 업데이트 완료!")
+                st.rerun()
         else:
-            st.header("📅 일일 작업 일지")
-            with st.expander("➕ 새 작업 일지 작성하기"):
-                with st.form("work_log_form", clear_on_submit=True):
-                    c1, c2, c3 = st.columns(3)
-                    with c1: log_date = st.date_input("작업 일자")
-                    with c2: worker_name = st.text_input("작업자명")
-                    with c3: shift = st.selectbox("근무조", ["주간", "야간", "특근/기타"])
-                        
-                    machine_used = st.selectbox("가공 장비", ["전체/공통", "두산 DNM500", "두산 DNM650", "두산 GT2100"])
-                    tasks_done = st.text_area("생산 내역 (품명 및 수량 등)", height=100)
-                    issues_notes = st.text_area("특이사항 및 인수인계", height=100)
-                    log_images = st.file_uploader("📷 작업/현장 사진 첨부", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-                    
-                    if st.form_submit_button("💾 일지 저장하기"):
-                        if worker_name and tasks_done:
-                            imgs = [base64.b64encode(i.read()).decode('utf-8') for i in log_images] if log_images else []
-                            db["work_logs"].append({"id": datetime.now().strftime("%Y%m%d%H%M%S"), "date": log_date.strftime("%Y-%m-%d"), "worker": worker_name, "shift": shift, "machine": machine_used, "tasks": tasks_done, "issues": issues_notes, "images_b64": imgs, "image_b64": "", "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")})
-                            save_data(db)
-                            st.success("저장 완료!")
-                            st.rerun()
-
-            st.markdown("---")
-            selected_count = sum(1 for l in db["work_logs"] if st.session_state.get(f"print_log_{l['id']}", False))
-            c1, c2 = st.columns([3, 1])
-            with c1: st.info("💡 **출력 팁:** 인쇄할 일지의 `🖨️ 인쇄 선택` 체크박스를 체크한 후 우측 버튼을 클릭하세요!")
-            with c2:
-                if selected_count > 0:
-                    if st.button(f"🖨️ 선택 항목({selected_count}개) 보고서 출력", type="primary", use_container_width=True):
-                        # 리렌더링 전에 체크된 ID들을 세션에 저장
-                        st.session_state.selected_print_log = [l['id'] for l in db["work_logs"] if st.session_state.get(f"print_log_{l['id']}", False)]
-                        st.session_state.print_mode_log = True
-                        st.rerun()
-                else:
-                    st.button("🖨️ 항목을 선택해주세요", disabled=True, use_container_width=True)
-
-            search_log = st.text_input("🔍 작업자, 장비, 내용 검색")
-            filtered_logs = db["work_logs"]
-            if search_log: filtered_logs = [l for l in filtered_logs if search_log.lower() in l["worker"].lower() or search_log.lower() in l["machine"].lower() or search_log.lower() in l["tasks"].lower()]
-                
-            for log in reversed(filtered_logs):
-                with st.expander(f"📅 [{log['date']}] {log['worker']} ({log['shift']}) - {log['machine']}"):
-                    st.checkbox("🖨️ 이 일지 인쇄 선택", key=f"print_log_{log['id']}")
-                    
-                    st.markdown("**🛠️ 생산 내역:**")
-                    st.write(log['tasks'])
-                    st.markdown("**⚠️ 특이사항 및 인수인계:**")
-                    st.info(log['issues'] if log['issues'] else "특이사항 없음")
-                    
-                    imgs = log.get("images_b64", [])
-                    if not imgs and log.get("image_b64"): imgs = [log["image_b64"]]
-                    if imgs:
-                        cols = st.columns(min(len(imgs), 3))
-                        for i, img_b64 in enumerate(imgs): cols[i % min(len(imgs), 3)].image(base64.b64decode(img_b64), use_column_width=True)
-                    
-                    col_btn1, col_btn2 = st.columns([1, 1])
-                    with col_btn1:
-                        with st.expander("✏️ 일지 수정하기"):
-                            with st.form(f"edit_log_form_{log['id']}"):
-                                edit_worker = st.text_input("작업자명 수정", value=log['worker'])
-                                edit_tasks = st.text_area("생산 내역 수정", value=log['tasks'], height=100)
-                                edit_issues = st.text_area("특이사항 수정", value=log['issues'], height=100)
-                                
-                                edit_images = st.file_uploader("📷 새 사진 첨부 (기존 사진 덮어쓰기, 여러 장 가능)", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key=f"edit_img_{log['id']}")
-                                delete_image = st.checkbox("🗑️ 기존 사진 모두 삭제", key=f"del_img_{log['id']}")
-                                
-                                if st.form_submit_button("💾 수정 저장"):
-                                    for idx, l in enumerate(db["work_logs"]):
-                                        if l["id"] == log["id"]:
-                                            db["work_logs"][idx]["worker"] = edit_worker
-                                            db["work_logs"][idx]["tasks"] = edit_tasks
-                                            db["work_logs"][idx]["issues"] = edit_issues
-                                            
-                                            if edit_images:
-                                                db["work_logs"][idx]["images_b64"] = [base64.b64encode(img.read()).decode('utf-8') for img in edit_images]
-                                                db["work_logs"][idx]["image_b64"] = ""
-                                            elif delete_image:
-                                                db["work_logs"][idx]["images_b64"] = []
-                                                db["work_logs"][idx]["image_b64"] = ""
-                                            break
-                                    save_data(db)
-                                    st.rerun()
-                    with col_btn2:
-                        if st.button("❌ 일지 삭제", key=f"del_log_{log['id']}"):
-                            db["work_logs"] = [l for l in db["work_logs"] if l["id"] != log["id"]]
-                            save_data(db)
-                            st.rerun()
-
-# ---------------------------------------------------------
-# 동적 생성된 거래처 장부 라우팅
-# ---------------------------------------------------------
-else:
-    for comp in db.get("companies", []):
-        if 메인메뉴 == comp["name"]:
-            장부_화면_출력(f"🏢 {comp['name']} 장부", f"{comp['file_prefix']}_장부.json", comp["categories"])
-            break
+            st.info("등록된 메모가 없습니다.")
