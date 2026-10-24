@@ -21,7 +21,10 @@ import streamlit.components.v1 as components
 # =====================================================================
 st.set_page_config(page_title="GSE 현장 통합 사무장", layout="wide", page_icon="🚀", initial_sidebar_state="expanded")
 
-BASE_DIR = Path("/app") if os.path.exists("/app") else Path(".")
+# Streamlit Community Cloud에서는 저장소(/mount/src)가 읽기 전용일 수 있으므로
+# 쓰기 가능한 임시 디렉터리를 사용합니다. 로컬 실행 경로는 기존대로 유지합니다.
+IS_STREAMLIT_CLOUD = os.path.exists("/mount/src")
+BASE_DIR = Path("/tmp/cnc-app") if IS_STREAMLIT_CLOUD else (Path("/app") if os.path.exists("/app") else Path("."))
 ALL_DATA_DIR = BASE_DIR / "all_data"
 INBOX_DIR = BASE_DIR / "inbox"
 DATA_DIR = BASE_DIR / "data"
