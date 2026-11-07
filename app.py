@@ -93,11 +93,19 @@ if is_backup_mode:
 else:
     DB_PATH = DATA_DIR / "gse_precision.db"
 
+
+def db_connect():
+    """Open the active DB; historical snapshots are enforced read-only at SQLite level."""
+    if is_backup_mode:
+        return sqlite3.connect(f"file:{DB_PATH.resolve()}?mode=ro", uri=True, timeout=30)
+    return sqlite3.connect(str(DB_PATH), timeout=30)
+
+
 def init_db():
     # Backup snapshots are strictly read-only; do not run DDL or enable WAL on them.
     if is_backup_mode:
         return
-    with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
+    with db_connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -300,7 +308,7 @@ def render_quick_prompts(tab, category):
             c1, c2 = st.columns([5, 1])
             if c1.button(row['prompt_text'], key=f"btn_q_{row['id']}", use_container_width=True):
                 clicked_prompt = row['prompt_text']
-            if c2.button("❌", key=f"del_q_{row['id']}"):
+            if c2.button("❌", key=f"del_q_{row['id']}", disabled=is_backup_mode):
                 with sqlite3.connect(str(DB_PATH), timeout=30) as conn: conn.execute("DELETE FROM quick_prompts WHERE id=?", (row['id'],))
                 st.rerun()
 
