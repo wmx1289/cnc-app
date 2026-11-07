@@ -288,7 +288,7 @@ clicked_prompt = None
 st.sidebar.subheader("💡 퀵 버튼 (현장 지시)")
 tab_q_tool, tab_q_mat, tab_q_con, tab_q_etc, tab_q_add = st.sidebar.tabs(["🛠️ 공구", "🧪 소재", "🛢 소모품", "📁 기타", "➕ 등록"])
 
-with sqlite3.connect(str(DB_PATH)) as conn:
+with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
     prompts_df = pd.read_sql_query("SELECT * FROM quick_prompts", conn)
 
 def render_quick_prompts(tab, category):
@@ -301,7 +301,7 @@ def render_quick_prompts(tab, category):
             if c1.button(row['prompt_text'], key=f"btn_q_{row['id']}", use_container_width=True):
                 clicked_prompt = row['prompt_text']
             if c2.button("❌", key=f"del_q_{row['id']}"):
-                with sqlite3.connect(str(DB_PATH)) as conn: conn.execute("DELETE FROM quick_prompts WHERE id=?", (row['id'],))
+                with sqlite3.connect(str(DB_PATH), timeout=30) as conn: conn.execute("DELETE FROM quick_prompts WHERE id=?", (row['id'],))
                 st.rerun()
 
 render_quick_prompts(tab_q_tool, "공구")
@@ -316,7 +316,7 @@ with tab_q_add:
     if st.button("💾 등록", use_container_width=True, type="primary", disabled=is_backup_mode):
         if new_q_text.strip():
             try:
-                with sqlite3.connect(str(DB_PATH)) as conn:
+                with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                     conn.execute("INSERT INTO quick_prompts (prompt_text, category) VALUES (?,?)", (new_q_text.strip(), new_q_cat))
                 st.rerun()
             except sqlite3.IntegrityError: st.error("이미 동일한 질문이 있습니다.")
@@ -348,7 +348,7 @@ if menu == "💬 1. 스마트 사무장":
                     if data and data.get('items'):
                         items_list = data['items']
                         st.dataframe(pd.DataFrame(items_list), use_container_width=True)
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                             for item in items_list:
                                 u_price = int(re.sub(r'[^0-9]', '', str(item.get('unit_price', '0'))))
                                 qty = int(re.sub(r'[^0-9]', '', str(item.get('quantity', '1'))))
@@ -382,7 +382,7 @@ if menu == "💬 1. 스마트 사무장":
             is_sales = any(w in final_prompt for w in ["매출", "발주서", "제작"])
             table_name = "quotes" if is_sales else "tool_ledger"
             
-            with sqlite3.connect(str(DB_PATH)) as conn:
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                 df = pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY quote_date DESC", conn)
             
             if not df.empty:
@@ -446,7 +446,7 @@ elif menu == "📊 2. 통합 장부 센터":
     with tab_view:
         st.subheader("통합 매입 장부 목록")
         sort_opt = st.radio("🔄 뷰(View) 정렬 기준", ["업체별", "날짜별(최신순)", "품목별(가나다순)"], horizontal=True)
-        with sqlite3.connect(str(DB_PATH)) as conn: df_view = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
+        with sqlite3.connect(str(DB_PATH), timeout=30) as conn: df_view = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
             
         if not df_view.empty:
             df_view['clean_date'] = pd.to_datetime(df_view['quote_date'], errors='coerce')
@@ -465,7 +465,7 @@ elif menu == "📊 2. 통합 장부 센터":
         st.subheader("🛠️ 장부 데이터 직접 편집")
         sort_opt_edit = st.radio("🔄 편집 뷰(View) 정렬 기준", ["업체별", "날짜별(최신순)", "품목별(가나다순)"], horizontal=True, key="sort_edit_radio")
         
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
             df_edit = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
             
         if not df_edit.empty:
@@ -485,12 +485,12 @@ elif menu == "📊 2. 통합 장부 센터":
         )
         
         if st.button("💾 매입 장부 덮어쓰기 저장", type="primary", disabled=is_backup_mode):
-            with sqlite3.connect(str(DB_PATH)) as conn: edited_tools.to_sql("tool_ledger", conn, if_exists="replace", index=False)
+            with sqlite3.connect(str(DB_PATH), timeout=30) as conn: edited_tools.to_sql("tool_ledger", conn, if_exists="replace", index=False)
             st.success("✅ 장부 업데이트 완료!"); st.rerun()
 
     with tab_print:
         st.subheader("🖨️ 거래처별 정산서 출력")
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
             df_print = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
             
         if not df_print.empty:
@@ -582,7 +582,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     if part_name.strip():
                         sheet_id = datetime.now().strftime("%Y%m%d%H%M%S")
                         imgs_b64 = json.dumps([base64.b64encode(i.read()).decode() for i in images]) if images else "[]"
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                             conn.execute("INSERT INTO setup_sheets (id, quote_date, part_name, machine, category, material, g_code_coord, tool_info, knowhow, images_b64) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                         (sheet_id, datetime.now().strftime("%Y-%m-%d"), part_name, machine, "방산/일반", material, g_code_coord, tool_info, knowhow, imgs_b64))
                         st.success("✅ 저장 완료!")
@@ -590,7 +590,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     else:
                         st.error("⚠️ 품번/품명을 입력해주세요.")
 
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
             # 💡 기존에는 일부 컬럼만 불러왔으나, 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
             df_setup = pd.read_sql_query("SELECT * FROM setup_sheets ORDER BY id DESC", conn)
         
@@ -617,7 +617,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
             )
             
             if st.button("💾 셋업 시트 덮어쓰기 저장", key="save_setup", disabled=is_backup_mode):
-                with sqlite3.connect(str(DB_PATH)) as conn:
+                with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                     edited_setup.to_sql("setup_sheets", conn, if_exists="replace", index=False)
                 st.success("✅ 셋업 시트 업데이트 완료!")
                 st.rerun()
@@ -636,7 +636,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                 
                 if st.form_submit_button("💾 G코드 저장", disabled=is_backup_mode):
                     if g_title.strip() and g_code.strip():
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                             conn.execute("INSERT INTO gcodes (title, machine, code, description) VALUES (?,?,?,?)",
                                          (g_title, g_machine, g_code, g_desc))
                         st.success("✅ G코드 저장 완료!")
@@ -644,7 +644,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     else:
                         st.error("⚠️ 제목과 G코드 내용을 모두 입력해주세요.")
         
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
             # 💡 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
             df_gcode = pd.read_sql_query("SELECT * FROM gcodes", conn)
             
@@ -666,7 +666,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
             )
             
             if st.button("💾 G코드 덮어쓰기 저장", key="save_gcode", disabled=is_backup_mode):
-                with sqlite3.connect(str(DB_PATH)) as conn: 
+                with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
                     edited_gcode.to_sql("gcodes", conn, if_exists="replace", index=False)
                 st.success("✅ G코드 업데이트 완료!")
                 st.rerun()
@@ -686,7 +686,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     if m_title.strip() and m_content.strip():
                         m_id = datetime.now().strftime("%Y%m%d%H%M%S")
                         m_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
                             conn.execute("INSERT INTO memos (id, title, content, date) VALUES (?,?,?,?)",
                                          (m_id, m_title, m_content, m_date))
                         st.success("✅ 메모 저장 완료!")
@@ -694,7 +694,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     else:
                         st.error("⚠️ 제목과 메모 내용을 모두 입력해주세요.")
                         
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
             # 💡 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
             df_memo = pd.read_sql_query("SELECT * FROM memos ORDER BY date DESC", conn)
             
@@ -715,7 +715,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
             )
             
             if st.button("💾 메모 덮어쓰기 저장", key="save_memo", disabled=is_backup_mode):
-                with sqlite3.connect(str(DB_PATH)) as conn: 
+                with sqlite3.connect(str(DB_PATH), timeout=30) as conn: 
                     edited_memo.to_sql("memos", conn, if_exists="replace", index=False)
                 st.success("✅ 메모 업데이트 완료!")
                 st.rerun()
