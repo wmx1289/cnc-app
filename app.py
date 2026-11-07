@@ -12,6 +12,7 @@ import pdfplumber
 from PIL import Image
 import pytesseract
 import base64
+import uuid
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -181,7 +182,9 @@ def extract_text_from_file(file_path):
         if suffix == '.pdf':
             with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
-                    text += page.extract_text() or "" + "\n"
+                    # Always separate pages; the previous expression only added a newline
+                    # when extract_text() returned None because of operator precedence.
+                    text += (page.extract_text() or "") + "\n"
         elif suffix in ['.png', '.jpg', '.jpeg']:
             # pytesseract를 이용한 이미지 OCR
             img = Image.open(file_path)
@@ -357,7 +360,13 @@ if menu == "💬 1. 스마트 사무장":
         else:
             up_file = st.file_uploader("영수증이나 거래명세서 이미지/PDF를 올려주세요.", type=['png', 'jpg', 'jpeg', 'pdf'])
             if up_file and st.button("🚀 서류 자동 분석 및 등록", type="primary"):
-                t_path = INBOX_DIR / up_file.name
+                # Never use an uploaded filename as a filesystem path. Use a unique name
+                # while preserving only the validated extension for the OCR dispatcher.
+                upload_suffix = Path(up_file.name).suffix.lower()
+                if upload_suffix not in {".png", ".jpg", ".jpeg", ".pdf"}:
+                    st.error("지원하지 않는 파일 형식입니다.")
+                    st.stop()
+                t_path = INBOX_DIR / f"{uuid.uuid4().hex}{upload_suffix}"
                 with open(t_path, "wb") as f: f.write(up_file.getbuffer())
                 
                 with st.status("🔍 파이썬 OCR 및 정규식 엔진으로 텍스트를 추출 중입니다...", expanded=True) as status:
