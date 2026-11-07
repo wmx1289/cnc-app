@@ -35,6 +35,16 @@ Until that migration is complete:
 - download backups to a separate, access-controlled storage location;
 - do not merge independently edited SQLite files by copying one over another.
 
+## Streamlit Community Cloud limitation
+
+Streamlit Community Cloud does not provide a durable local disk volume for app
+data. Setting `CNC_DATA_DIR` there only changes the temporary container path; it
+does not make that path persistent across rebuilds or restarts. The warning in
+the app is intentional. For production use with Cloud and office computers,
+the central managed PostgreSQL backend must be completed before treating Cloud
+as a writable source of truth. Until then, do not rely on Cloud-local writes for
+records that must survive a restart.
+
 ## Backups
 
 The app creates a daily SQLite online-backup snapshot before schema setup and
