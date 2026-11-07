@@ -18,11 +18,11 @@ by this branch.
    durable mounted volume or move records and attachments to a managed persistent
    store. Do not assume the repository filesystem is writable.
 
-2. **Legacy JSON migration can hide failures.**
-   The migration loop catches broad exceptions and silently continues. This makes
-   it difficult to know whether all rows were imported. The next phase should add
-   a migration ledger, transaction boundaries, row counts, and a downloadable
-   error report. Existing JSON files should only be renamed after verified success.
+2. **Legacy JSON migration previously hid failures.**
+   The improvement branch now adds a per-file migration ledger, content hashes,
+   transaction/savepoint rollback, row counts, visible errors, and archive-after-commit
+   behavior. A failed source remains in place for retry. A downloadable error report
+   and a review of previously partially imported legacy files remain future work.
 
 3. **Receipt extraction is heuristic, not accounting-grade.**
    Selecting the largest comma-formatted number as the unit price can mistake a
@@ -52,9 +52,11 @@ by this branch.
 
 ## Changes made in this branch
 
-- Fixed PDF page text concatenation so a newline is always appended after each page.
-- Replaced the user-supplied upload filename with a UUID filename and allow-listed
-  extension for receipt uploads.
+- Fixed PDF page text concatenation and secured receipt upload filenames.
+- Added configurable data/backup paths, verified SQLite online backups, daily snapshots,
+  in-memory database export, WAL/FULL durability settings, and read-only backup access.
+- Added transactional, idempotent legacy JSON migrations with a migration ledger.
+- Added Python syntax and data-safety tests in GitHub Actions.
 
 ## Recommended implementation sequence
 
