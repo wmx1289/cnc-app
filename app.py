@@ -12,6 +12,10 @@ import pdfplumber
 from PIL import Image
 import pytesseract
 import base64
+import uuid
+
+from backup_manager import create_daily_backup, create_sqlite_backup, sqlite_backup_bytes
+from legacy_migrations import migrate_legacy_json
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -21,21 +25,23 @@ import streamlit.components.v1 as components
 # =====================================================================
 st.set_page_config(page_title="GSE 현장 통합 사무장", layout="wide", page_icon="🚀", initial_sidebar_state="expanded")
 
-# Streamlit Community Cloud에서는 저장소(/mount/src)가 읽기 전용일 수 있으므로
-# 쓰기 가능한 임시 디렉터리를 사용합니다. 로컬 실행 경로는 기존대로 유지합니다.
+# CNC_DATA_DIR를 지정하면 환경별 영구 저장 경로를 사용합니다. 미설정 시 기존 경로를
+# 그대로 유지해 기존 설치 데이터가 자동으로 이동되거나 덮어쓰이지 않도록 합니다.
 IS_STREAMLIT_CLOUD = os.path.exists("/mount/src")
-BASE_DIR = Path("/tmp/cnc-app") if IS_STREAMLIT_CLOUD else (Path("/app") if os.path.exists("/app") else Path("."))
+LEGACY_BASE_DIR = Path("/tmp/cnc-app") if IS_STREAMLIT_CLOUD else (Path("/app") if os.path.exists("/app") else Path("."))
+BASE_DIR = Path(os.environ["CNC_DATA_DIR"]).expanduser() if os.getenv("CNC_DATA_DIR") else LEGACY_BASE_DIR
 ALL_DATA_DIR = BASE_DIR / "all_data"
 INBOX_DIR = BASE_DIR / "inbox"
 DATA_DIR = BASE_DIR / "data"
 KNOWLEDGE_DIR = DATA_DIR / "web_knowledge"
-BACKUP_DIR = BASE_DIR / "backup"
+BACKUP_DIR = Path(os.environ.get("CNC_BACKUP_DIR", str(BASE_DIR / "backup"))).expanduser()
 
 for d in [ALL_DATA_DIR, INBOX_DIR, DATA_DIR, KNOWLEDGE_DIR, BACKUP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# 💡 모델 분리 및 최적화: 챗봇 전용 경량 모델 사용 (RTX 4060 8GB 최적화)
-CHAT_MODEL_NAME = "qwen2.5:7b" 
+# 모델과 Ollama 주소는 실행 환경별 환경변수로 설정할 수 있습니다.
+CHAT_MODEL_NAME = os.getenv("CNC_CHAT_MODEL", "qwen2.5:7b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 
 if 'chat_history' not in st.session_state: st.session_state.chat_history = []
 
@@ -87,8 +93,22 @@ if is_backup_mode:
 else:
     DB_PATH = DATA_DIR / "gse_precision.db"
 
+
+def db_connect():
+    """Open the active DB; historical snapshots are enforced read-only at SQLite level."""
+    if is_backup_mode:
+        return sqlite3.connect(f"file:{DB_PATH.resolve()}?mode=ro", uri=True, timeout=30)
+    return sqlite3.connect(str(DB_PATH), timeout=30)
+
+
 def init_db():
-    with sqlite3.connect(str(DB_PATH)) as conn:
+    # Backup snapshots are strictly read-only; do not run DDL or enable WAL on them.
+    if is_backup_mode:
+        return
+    with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("""CREATE TABLE IF NOT EXISTS quotes (
             id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, company TEXT, 
             part_name TEXT, material TEXT, unit_price INTEGER, quantity INTEGER, total_price INTEGER,
@@ -113,65 +133,27 @@ def init_db():
             id TEXT PRIMARY KEY, title TEXT, content TEXT, date TEXT)""")
 
 def migrate_old_json_data():
-    if is_backup_mode: return
-    with sqlite3.connect(str(DB_PATH)) as conn:
-        # 1. 기존 매입 장부 마이그레이션
-        for json_file in BASE_DIR.glob("*_장부.json"):
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for item in data:
-                    conn.execute("""
-                        INSERT INTO tool_ledger (quote_date, company, category, part_name, unit_price, quantity, total_price)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        item.get("일자", ""), item.get("거래처", ""), item.get("분류", "미분류"),
-                        item.get("품목명", ""), int(item.get("단가", 0)), int(item.get("수량", 0)), int(item.get("총액", 0))
-                    ))
-                os.rename(json_file, str(json_file) + ".backup")
-            except Exception:
-                pass
+    if is_backup_mode:
+        return
+    with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
+        migration_errors = migrate_legacy_json(conn, BASE_DIR)
+    for migration_error in migration_errors:
+        st.error(f"기존 데이터 이전 실패 (원본 파일 보존됨): {migration_error}")
 
-        # 2. machining_db.json (셋업 시트, G코드, 메모) 마이그레이션
-        machining_json = BASE_DIR / "machining_db.json"
-        if machining_json.exists():
-            try:
-                with open(machining_json, 'r', encoding='utf-8') as f:
-                    db_data = json.load(f)
-                
-                # 셋업 시트 복원
-                for sheet in db_data.get("setup_sheets", []):
-                    imgs = sheet.get("images_b64", [])
-                    if sheet.get("image_b64") and not imgs: imgs = [sheet.get("image_b64")]
-                    date_str = sheet.get("date", "").split(" ")[0] if sheet.get("date") else datetime.now().strftime("%Y-%m-%d")
-                    
-                    conn.execute("""INSERT OR IGNORE INTO setup_sheets 
-                        (id, quote_date, part_name, machine, category, material, g_code_coord, tool_info, knowhow, images_b64) 
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""", 
-                        (sheet.get("id", ""), date_str, sheet.get("part_name", ""), sheet.get("machine", ""), 
-                         sheet.get("category", "방산/일반"), sheet.get("material", ""), sheet.get("g_code_coord", ""), 
-                         sheet.get("tool_info", ""), sheet.get("knowhow", ""), json.dumps(imgs)))
-                
-                # G코드 복원
-                for g in db_data.get("gcodes", []):
-                    conn.execute("INSERT INTO gcodes (title, machine, code, description) VALUES (?,?,?,?)",
-                                 (g.get("title", ""), g.get("machine", ""), g.get("code", ""), g.get("description", "")))
-                
-                # 가공 메모 복원
-                for m in db_data.get("memos", []):
-                    conn.execute("INSERT OR IGNORE INTO memos (id, title, content, date) VALUES (?,?,?,?)",
-                                 (m.get("id", ""), m.get("title", ""), m.get("content", ""), m.get("date", "")))
-                
-                conn.commit()
-                os.rename(machining_json, str(machining_json) + ".backup")
-            except Exception as e:
-                st.error(f"machining_db.json 불러오기 오류: {e}")
+
+if not is_backup_mode and DB_PATH.exists():
+    try:
+        create_daily_backup(DB_PATH, BACKUP_DIR, retention=30)
+    except Exception as backup_error:
+        st.warning(f"자동 안전 백업을 만들지 못했습니다. 기존 DB는 유지됩니다: {backup_error}")
+
+if IS_STREAMLIT_CLOUD and not os.getenv("CNC_DATA_DIR"):
+    st.warning("클라우드 임시 저장 경로를 사용 중입니다. 재배포 후 데이터가 사라질 수 있습니다. CNC_DATA_DIR에 영구 볼륨 경로를 설정하세요.")
 
 init_db()
 migrate_old_json_data()
 
 
-# =====================================================================
 # [SECTION 3] 순수 Python 기반 영수증 텍스트 판독 엔진 (Vision AI 대체)
 # =====================================================================
 def extract_text_from_file(file_path):
@@ -181,7 +163,9 @@ def extract_text_from_file(file_path):
         if suffix == '.pdf':
             with pdfplumber.open(file_path) as pdf:
                 for page in pdf.pages:
-                    text += page.extract_text() or "" + "\n"
+                    # Always separate pages; the previous expression only added a newline
+                    # when extract_text() returned None because of operator precedence.
+                    text += (page.extract_text() or "") + "\n"
         elif suffix in ['.png', '.jpg', '.jpeg']:
             # pytesseract를 이용한 이미지 OCR
             img = Image.open(file_path)
@@ -284,7 +268,7 @@ def get_ai_briefing(user_prompt, total_sum, count):
     
     try:
         def stream_generator():
-            with requests.post("http://localhost:11434/api/chat", json=payload, stream=True) as response:
+            with requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, stream=True) as response:
                 if response.status_code != 200:
                     yield f"Ollama 연결 에러 (모델명: {CHAT_MODEL_NAME} 설치 확인요망): {response.status_code}"
                     return
@@ -312,7 +296,7 @@ clicked_prompt = None
 st.sidebar.subheader("💡 퀵 버튼 (현장 지시)")
 tab_q_tool, tab_q_mat, tab_q_con, tab_q_etc, tab_q_add = st.sidebar.tabs(["🛠️ 공구", "🧪 소재", "🛢 소모품", "📁 기타", "➕ 등록"])
 
-with sqlite3.connect(str(DB_PATH)) as conn:
+with db_connect() as conn:
     prompts_df = pd.read_sql_query("SELECT * FROM quick_prompts", conn)
 
 def render_quick_prompts(tab, category):
@@ -324,8 +308,8 @@ def render_quick_prompts(tab, category):
             c1, c2 = st.columns([5, 1])
             if c1.button(row['prompt_text'], key=f"btn_q_{row['id']}", use_container_width=True):
                 clicked_prompt = row['prompt_text']
-            if c2.button("❌", key=f"del_q_{row['id']}"):
-                with sqlite3.connect(str(DB_PATH)) as conn: conn.execute("DELETE FROM quick_prompts WHERE id=?", (row['id'],))
+            if c2.button("❌", key=f"del_q_{row['id']}", disabled=is_backup_mode):
+                with db_connect() as conn: conn.execute("DELETE FROM quick_prompts WHERE id=?", (row['id'],))
                 st.rerun()
 
 render_quick_prompts(tab_q_tool, "공구")
@@ -340,7 +324,7 @@ with tab_q_add:
     if st.button("💾 등록", use_container_width=True, type="primary", disabled=is_backup_mode):
         if new_q_text.strip():
             try:
-                with sqlite3.connect(str(DB_PATH)) as conn:
+                with db_connect() as conn:
                     conn.execute("INSERT INTO quick_prompts (prompt_text, category) VALUES (?,?)", (new_q_text.strip(), new_q_cat))
                 st.rerun()
             except sqlite3.IntegrityError: st.error("이미 동일한 질문이 있습니다.")
@@ -357,7 +341,13 @@ if menu == "💬 1. 스마트 사무장":
         else:
             up_file = st.file_uploader("영수증이나 거래명세서 이미지/PDF를 올려주세요.", type=['png', 'jpg', 'jpeg', 'pdf'])
             if up_file and st.button("🚀 서류 자동 분석 및 등록", type="primary"):
-                t_path = INBOX_DIR / up_file.name
+                # Never use an uploaded filename as a filesystem path. Use a unique name
+                # while preserving only the validated extension for the OCR dispatcher.
+                upload_suffix = Path(up_file.name).suffix.lower()
+                if upload_suffix not in {".png", ".jpg", ".jpeg", ".pdf"}:
+                    st.error("지원하지 않는 파일 형식입니다.")
+                    st.stop()
+                t_path = INBOX_DIR / f"{uuid.uuid4().hex}{upload_suffix}"
                 with open(t_path, "wb") as f: f.write(up_file.getbuffer())
                 
                 with st.status("🔍 파이썬 OCR 및 정규식 엔진으로 텍스트를 추출 중입니다...", expanded=True) as status:
@@ -366,7 +356,7 @@ if menu == "💬 1. 스마트 사무장":
                     if data and data.get('items'):
                         items_list = data['items']
                         st.dataframe(pd.DataFrame(items_list), use_container_width=True)
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with db_connect() as conn:
                             for item in items_list:
                                 u_price = int(re.sub(r'[^0-9]', '', str(item.get('unit_price', '0'))))
                                 qty = int(re.sub(r'[^0-9]', '', str(item.get('quantity', '1'))))
@@ -400,7 +390,7 @@ if menu == "💬 1. 스마트 사무장":
             is_sales = any(w in final_prompt for w in ["매출", "발주서", "제작"])
             table_name = "quotes" if is_sales else "tool_ledger"
             
-            with sqlite3.connect(str(DB_PATH)) as conn:
+            with db_connect() as conn:
                 df = pd.read_sql_query(f"SELECT * FROM {table_name} ORDER BY quote_date DESC", conn)
             
             if not df.empty:
@@ -464,7 +454,7 @@ elif menu == "📊 2. 통합 장부 센터":
     with tab_view:
         st.subheader("통합 매입 장부 목록")
         sort_opt = st.radio("🔄 뷰(View) 정렬 기준", ["업체별", "날짜별(최신순)", "품목별(가나다순)"], horizontal=True)
-        with sqlite3.connect(str(DB_PATH)) as conn: df_view = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
+        with db_connect() as conn: df_view = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
             
         if not df_view.empty:
             df_view['clean_date'] = pd.to_datetime(df_view['quote_date'], errors='coerce')
@@ -483,7 +473,7 @@ elif menu == "📊 2. 통합 장부 센터":
         st.subheader("🛠️ 장부 데이터 직접 편집")
         sort_opt_edit = st.radio("🔄 편집 뷰(View) 정렬 기준", ["업체별", "날짜별(최신순)", "품목별(가나다순)"], horizontal=True, key="sort_edit_radio")
         
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with db_connect() as conn: 
             df_edit = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
             
         if not df_edit.empty:
@@ -503,12 +493,12 @@ elif menu == "📊 2. 통합 장부 센터":
         )
         
         if st.button("💾 매입 장부 덮어쓰기 저장", type="primary", disabled=is_backup_mode):
-            with sqlite3.connect(str(DB_PATH)) as conn: edited_tools.to_sql("tool_ledger", conn, if_exists="replace", index=False)
+            with db_connect() as conn: edited_tools.to_sql("tool_ledger", conn, if_exists="replace", index=False)
             st.success("✅ 장부 업데이트 완료!"); st.rerun()
 
     with tab_print:
         st.subheader("🖨️ 거래처별 정산서 출력")
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with db_connect() as conn: 
             df_print = pd.read_sql_query("SELECT * FROM tool_ledger", conn)
             
         if not df_print.empty:
@@ -561,20 +551,16 @@ elif menu == "📊 2. 통합 장부 센터":
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🚀 월말 장부 수동/자동 백업 생성", type="primary", use_container_width=True, disabled=is_backup_mode):
-                now_str = datetime.now().strftime('%Y%m%d_%H%M%S') 
-                input_name = custom_backup_name.strip()
-                if input_name:
-                    backup_filename = input_name if input_name.endswith(".db") else f"{input_name}.db"
-                else:
-                    backup_filename = f"장부백업_{now_str}.db"
-                    
-                shutil.copy2(str(DB_PATH), str(BACKUP_DIR / backup_filename))
-                st.success(f"✅ [{backup_filename}] 스냅샷 생성 완료! (좌측 사이드바에서 즉시 열람 가능)")
+                try:
+                    snapshot = create_sqlite_backup(DB_PATH, BACKUP_DIR, prefix="manual", label=custom_backup_name.strip() or None)
+                    st.success(f"✅ [{snapshot.name}] 무결성 검사를 통과한 스냅샷을 생성했습니다.")
+                except Exception as backup_error:
+                    st.error(f"백업 생성 실패: {backup_error}")
                 st.rerun()
                 
         with c2:
             try:
-                with open(DB_PATH, "rb") as f: db_bytes = f.read()
+                db_bytes = sqlite_backup_bytes(DB_PATH)
                 st.download_button("💾 외부 저장소(USB)로 직접 다운로드", db_bytes, f"gse_장부_{datetime.now().strftime('%Y%m%d')}.db", "application/octet-stream", use_container_width=True)
             except Exception: st.warning("다운로드 할 수 없습니다.")
 
@@ -604,7 +590,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     if part_name.strip():
                         sheet_id = datetime.now().strftime("%Y%m%d%H%M%S")
                         imgs_b64 = json.dumps([base64.b64encode(i.read()).decode() for i in images]) if images else "[]"
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with db_connect() as conn:
                             conn.execute("INSERT INTO setup_sheets (id, quote_date, part_name, machine, category, material, g_code_coord, tool_info, knowhow, images_b64) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                         (sheet_id, datetime.now().strftime("%Y-%m-%d"), part_name, machine, "방산/일반", material, g_code_coord, tool_info, knowhow, imgs_b64))
                         st.success("✅ 저장 완료!")
@@ -612,7 +598,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     else:
                         st.error("⚠️ 품번/품명을 입력해주세요.")
 
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with db_connect() as conn: 
             # 💡 기존에는 일부 컬럼만 불러왔으나, 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
             df_setup = pd.read_sql_query("SELECT * FROM setup_sheets ORDER BY id DESC", conn)
         
@@ -639,7 +625,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
             )
             
             if st.button("💾 셋업 시트 덮어쓰기 저장", key="save_setup", disabled=is_backup_mode):
-                with sqlite3.connect(str(DB_PATH)) as conn:
+                with db_connect() as conn:
                     edited_setup.to_sql("setup_sheets", conn, if_exists="replace", index=False)
                 st.success("✅ 셋업 시트 업데이트 완료!")
                 st.rerun()
@@ -658,7 +644,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                 
                 if st.form_submit_button("💾 G코드 저장", disabled=is_backup_mode):
                     if g_title.strip() and g_code.strip():
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with db_connect() as conn:
                             conn.execute("INSERT INTO gcodes (title, machine, code, description) VALUES (?,?,?,?)",
                                          (g_title, g_machine, g_code, g_desc))
                         st.success("✅ G코드 저장 완료!")
@@ -666,7 +652,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     else:
                         st.error("⚠️ 제목과 G코드 내용을 모두 입력해주세요.")
         
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with db_connect() as conn: 
             # 💡 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
             df_gcode = pd.read_sql_query("SELECT * FROM gcodes", conn)
             
@@ -688,7 +674,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
             )
             
             if st.button("💾 G코드 덮어쓰기 저장", key="save_gcode", disabled=is_backup_mode):
-                with sqlite3.connect(str(DB_PATH)) as conn: 
+                with db_connect() as conn: 
                     edited_gcode.to_sql("gcodes", conn, if_exists="replace", index=False)
                 st.success("✅ G코드 업데이트 완료!")
                 st.rerun()
@@ -708,7 +694,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     if m_title.strip() and m_content.strip():
                         m_id = datetime.now().strftime("%Y%m%d%H%M%S")
                         m_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        with sqlite3.connect(str(DB_PATH)) as conn:
+                        with db_connect() as conn:
                             conn.execute("INSERT INTO memos (id, title, content, date) VALUES (?,?,?,?)",
                                          (m_id, m_title, m_content, m_date))
                         st.success("✅ 메모 저장 완료!")
@@ -716,7 +702,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
                     else:
                         st.error("⚠️ 제목과 메모 내용을 모두 입력해주세요.")
                         
-        with sqlite3.connect(str(DB_PATH)) as conn: 
+        with db_connect() as conn: 
             # 💡 덮어쓰기 저장을 위해 전체 데이터를 불러오도록 수정
             df_memo = pd.read_sql_query("SELECT * FROM memos ORDER BY date DESC", conn)
             
@@ -737,7 +723,7 @@ elif menu == "🏭 3. 셋업 시트 매니저":
             )
             
             if st.button("💾 메모 덮어쓰기 저장", key="save_memo", disabled=is_backup_mode):
-                with sqlite3.connect(str(DB_PATH)) as conn: 
+                with db_connect() as conn: 
                     edited_memo.to_sql("memos", conn, if_exists="replace", index=False)
                 st.success("✅ 메모 업데이트 완료!")
                 st.rerun()
