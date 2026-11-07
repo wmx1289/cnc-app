@@ -14,7 +14,7 @@ import pytesseract
 import base64
 import uuid
 
-from backup_manager import create_daily_backup, create_sqlite_backup
+from backup_manager import create_daily_backup, create_sqlite_backup, sqlite_backup_bytes
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -93,6 +93,9 @@ else:
     DB_PATH = DATA_DIR / "gse_precision.db"
 
 def init_db():
+    # Backup snapshots are strictly read-only; do not run DDL or enable WAL on them.
+    if is_backup_mode:
+        return
     with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
@@ -595,8 +598,7 @@ elif menu == "📊 2. 통합 장부 센터":
                 
         with c2:
             try:
-                export_path = create_sqlite_backup(DB_PATH, BACKUP_DIR, prefix="export")
-                db_bytes = export_path.read_bytes()
+                db_bytes = sqlite_backup_bytes(DB_PATH)
                 st.download_button("💾 외부 저장소(USB)로 직접 다운로드", db_bytes, f"gse_장부_{datetime.now().strftime('%Y%m%d')}.db", "application/octet-stream", use_container_width=True)
             except Exception: st.warning("다운로드 할 수 없습니다.")
 
