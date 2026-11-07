@@ -15,6 +15,7 @@ import base64
 import uuid
 
 from backup_manager import create_daily_backup, create_sqlite_backup, sqlite_backup_bytes
+from legacy_migrations import migrate_legacy_json
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -124,59 +125,13 @@ def init_db():
             id TEXT PRIMARY KEY, title TEXT, content TEXT, date TEXT)""")
 
 def migrate_old_json_data():
-    if is_backup_mode: return
-    with sqlite3.connect(str(DB_PATH)) as conn:
-        # 1. 기존 매입 장부 마이그레이션
-        for json_file in BASE_DIR.glob("*_장부.json"):
-            try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for item in data:
-                    conn.execute("""
-                        INSERT INTO tool_ledger (quote_date, company, category, part_name, unit_price, quantity, total_price)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        item.get("일자", ""), item.get("거래처", ""), item.get("분류", "미분류"),
-                        item.get("품목명", ""), int(item.get("단가", 0)), int(item.get("수량", 0)), int(item.get("총액", 0))
-                    ))
-                os.rename(json_file, str(json_file) + ".backup")
-            except Exception:
-                pass
+    if is_backup_mode:
+        return
+    with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
+        migration_errors = migrate_legacy_json(conn, BASE_DIR)
+    for migration_error in migration_errors:
+        st.error(f"기존 데이터 이전 실패 (원본 파일 보존됨): {migration_error}")
 
-        # 2. machining_db.json (셋업 시트, G코드, 메모) 마이그레이션
-        machining_json = BASE_DIR / "machining_db.json"
-        if machining_json.exists():
-            try:
-                with open(machining_json, 'r', encoding='utf-8') as f:
-                    db_data = json.load(f)
-                
-                # 셋업 시트 복원
-                for sheet in db_data.get("setup_sheets", []):
-                    imgs = sheet.get("images_b64", [])
-                    if sheet.get("image_b64") and not imgs: imgs = [sheet.get("image_b64")]
-                    date_str = sheet.get("date", "").split(" ")[0] if sheet.get("date") else datetime.now().strftime("%Y-%m-%d")
-                    
-                    conn.execute("""INSERT OR IGNORE INTO setup_sheets 
-                        (id, quote_date, part_name, machine, category, material, g_code_coord, tool_info, knowhow, images_b64) 
-                        VALUES (?,?,?,?,?,?,?,?,?,?)""", 
-                        (sheet.get("id", ""), date_str, sheet.get("part_name", ""), sheet.get("machine", ""), 
-                         sheet.get("category", "방산/일반"), sheet.get("material", ""), sheet.get("g_code_coord", ""), 
-                         sheet.get("tool_info", ""), sheet.get("knowhow", ""), json.dumps(imgs)))
-                
-                # G코드 복원
-                for g in db_data.get("gcodes", []):
-                    conn.execute("INSERT INTO gcodes (title, machine, code, description) VALUES (?,?,?,?)",
-                                 (g.get("title", ""), g.get("machine", ""), g.get("code", ""), g.get("description", "")))
-                
-                # 가공 메모 복원
-                for m in db_data.get("memos", []):
-                    conn.execute("INSERT OR IGNORE INTO memos (id, title, content, date) VALUES (?,?,?,?)",
-                                 (m.get("id", ""), m.get("title", ""), m.get("content", ""), m.get("date", "")))
-                
-                conn.commit()
-                os.rename(machining_json, str(machining_json) + ".backup")
-            except Exception as e:
-                st.error(f"machining_db.json 불러오기 오류: {e}")
 
 if not is_backup_mode and DB_PATH.exists():
     try:
@@ -191,7 +146,6 @@ init_db()
 migrate_old_json_data()
 
 
-# =====================================================================
 # [SECTION 3] 순수 Python 기반 영수증 텍스트 판독 엔진 (Vision AI 대체)
 # =====================================================================
 def extract_text_from_file(file_path):
