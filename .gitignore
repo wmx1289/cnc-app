@@ -1,0 +1,18 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime databases, snapshots, uploads, and local working data
+data/*.db
+data/*.db-*
+backup/*.db
+backup/*.db-*
+inbox/*
+all_data/
