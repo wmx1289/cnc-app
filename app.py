@@ -14,6 +14,8 @@ import pytesseract
 import base64
 import uuid
 
+from backup_manager import create_daily_backup, create_sqlite_backup
+
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -22,21 +24,23 @@ import streamlit.components.v1 as components
 # =====================================================================
 st.set_page_config(page_title="GSE 현장 통합 사무장", layout="wide", page_icon="🚀", initial_sidebar_state="expanded")
 
-# Streamlit Community Cloud에서는 저장소(/mount/src)가 읽기 전용일 수 있으므로
-# 쓰기 가능한 임시 디렉터리를 사용합니다. 로컬 실행 경로는 기존대로 유지합니다.
+# CNC_DATA_DIR를 지정하면 환경별 영구 저장 경로를 사용합니다. 미설정 시 기존 경로를
+# 그대로 유지해 기존 설치 데이터가 자동으로 이동되거나 덮어쓰이지 않도록 합니다.
 IS_STREAMLIT_CLOUD = os.path.exists("/mount/src")
-BASE_DIR = Path("/tmp/cnc-app") if IS_STREAMLIT_CLOUD else (Path("/app") if os.path.exists("/app") else Path("."))
+LEGACY_BASE_DIR = Path("/tmp/cnc-app") if IS_STREAMLIT_CLOUD else (Path("/app") if os.path.exists("/app") else Path("."))
+BASE_DIR = Path(os.environ["CNC_DATA_DIR"]).expanduser() if os.getenv("CNC_DATA_DIR") else LEGACY_BASE_DIR
 ALL_DATA_DIR = BASE_DIR / "all_data"
 INBOX_DIR = BASE_DIR / "inbox"
 DATA_DIR = BASE_DIR / "data"
 KNOWLEDGE_DIR = DATA_DIR / "web_knowledge"
-BACKUP_DIR = BASE_DIR / "backup"
+BACKUP_DIR = Path(os.environ.get("CNC_BACKUP_DIR", str(BASE_DIR / "backup"))).expanduser()
 
 for d in [ALL_DATA_DIR, INBOX_DIR, DATA_DIR, KNOWLEDGE_DIR, BACKUP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-# 💡 모델 분리 및 최적화: 챗봇 전용 경량 모델 사용 (RTX 4060 8GB 최적화)
-CHAT_MODEL_NAME = "qwen2.5:7b" 
+# 모델과 Ollama 주소는 실행 환경별 환경변수로 설정할 수 있습니다.
+CHAT_MODEL_NAME = os.getenv("CNC_CHAT_MODEL", "qwen2.5:7b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 
 if 'chat_history' not in st.session_state: st.session_state.chat_history = []
 
@@ -89,7 +93,10 @@ else:
     DB_PATH = DATA_DIR / "gse_precision.db"
 
 def init_db():
-    with sqlite3.connect(str(DB_PATH)) as conn:
+    with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("""CREATE TABLE IF NOT EXISTS quotes (
             id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, company TEXT, 
             part_name TEXT, material TEXT, unit_price INTEGER, quantity INTEGER, total_price INTEGER,
@@ -167,6 +174,15 @@ def migrate_old_json_data():
                 os.rename(machining_json, str(machining_json) + ".backup")
             except Exception as e:
                 st.error(f"machining_db.json 불러오기 오류: {e}")
+
+if not is_backup_mode and DB_PATH.exists():
+    try:
+        create_daily_backup(DB_PATH, BACKUP_DIR, retention=30)
+    except Exception as backup_error:
+        st.warning(f"자동 안전 백업을 만들지 못했습니다. 기존 DB는 유지됩니다: {backup_error}")
+
+if IS_STREAMLIT_CLOUD and not os.getenv("CNC_DATA_DIR"):
+    st.warning("클라우드 임시 저장 경로를 사용 중입니다. 재배포 후 데이터가 사라질 수 있습니다. CNC_DATA_DIR에 영구 볼륨 경로를 설정하세요.")
 
 init_db()
 migrate_old_json_data()
@@ -287,7 +303,7 @@ def get_ai_briefing(user_prompt, total_sum, count):
     
     try:
         def stream_generator():
-            with requests.post("http://localhost:11434/api/chat", json=payload, stream=True) as response:
+            with requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, stream=True) as response:
                 if response.status_code != 200:
                     yield f"Ollama 연결 에러 (모델명: {CHAT_MODEL_NAME} 설치 확인요망): {response.status_code}"
                     return
@@ -570,20 +586,17 @@ elif menu == "📊 2. 통합 장부 센터":
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🚀 월말 장부 수동/자동 백업 생성", type="primary", use_container_width=True, disabled=is_backup_mode):
-                now_str = datetime.now().strftime('%Y%m%d_%H%M%S') 
-                input_name = custom_backup_name.strip()
-                if input_name:
-                    backup_filename = input_name if input_name.endswith(".db") else f"{input_name}.db"
-                else:
-                    backup_filename = f"장부백업_{now_str}.db"
-                    
-                shutil.copy2(str(DB_PATH), str(BACKUP_DIR / backup_filename))
-                st.success(f"✅ [{backup_filename}] 스냅샷 생성 완료! (좌측 사이드바에서 즉시 열람 가능)")
+                try:
+                    snapshot = create_sqlite_backup(DB_PATH, BACKUP_DIR, prefix="manual", label=custom_backup_name.strip() or None)
+                    st.success(f"✅ [{snapshot.name}] 무결성 검사를 통과한 스냅샷을 생성했습니다.")
+                except Exception as backup_error:
+                    st.error(f"백업 생성 실패: {backup_error}")
                 st.rerun()
                 
         with c2:
             try:
-                with open(DB_PATH, "rb") as f: db_bytes = f.read()
+                export_path = create_sqlite_backup(DB_PATH, BACKUP_DIR, prefix="export")
+                db_bytes = export_path.read_bytes()
                 st.download_button("💾 외부 저장소(USB)로 직접 다운로드", db_bytes, f"gse_장부_{datetime.now().strftime('%Y%m%d')}.db", "application/octet-stream", use_container_width=True)
             except Exception: st.warning("다운로드 할 수 없습니다.")
 
