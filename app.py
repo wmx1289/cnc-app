@@ -105,7 +105,7 @@ def init_db():
     # Backup snapshots are strictly read-only; do not run DDL or enable WAL on them.
     if is_backup_mode:
         return
-    with db_connect() as conn:
+    with sqlite3.connect(str(DB_PATH), timeout=30) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA busy_timeout=30000")
