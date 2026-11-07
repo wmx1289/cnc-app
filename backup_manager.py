@@ -73,3 +73,17 @@ def create_daily_backup(
     for old_backup in automatic[max(retention, 0):]:
         old_backup.unlink(missing_ok=True)
     return created
+
+
+def sqlite_backup_bytes(source_path: str | Path) -> bytes:
+    """Return a consistent SQLite snapshot as bytes without creating a backup file."""
+    source = Path(source_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Database does not exist: {source}")
+    with sqlite3.connect(f"file:{source.resolve()}?mode=ro", uri=True, timeout=30) as src:
+        with sqlite3.connect(":memory:") as snapshot:
+            src.backup(snapshot)
+            result = snapshot.execute("PRAGMA integrity_check").fetchone()
+            if not result or result[0] != "ok":
+                raise sqlite3.DatabaseError("Database snapshot failed integrity_check")
+            return snapshot.serialize()
