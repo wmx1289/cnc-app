@@ -20,7 +20,12 @@ import streamlit.components.v1 as components
 # =====================================================================
 st.set_page_config(page_title="GSE 현장 기록노트 (로컬PC)", layout="wide", page_icon="🛠️", initial_sidebar_state="expanded")
 
-BASE_DIR = Path("/app") if os.path.exists("/app") else Path(".")
+# Streamlit Cloud에서는 쓰기 가능한 임시 경로 사용
+if Path("/mount/src/cnc-app").exists():
+    BASE_DIR = Path("/tmp/cnc-app")
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+
 ALL_DATA_DIR = BASE_DIR / "all_data"
 INBOX_DIR = BASE_DIR / "inbox"
 DATA_DIR = BASE_DIR / "data"
